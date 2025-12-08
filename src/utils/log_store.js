@@ -3,25 +3,40 @@ import path from 'path';
 import { randomUUID } from 'crypto';
 import { gzipSync, gunzipSync } from 'zlib';
 import { fileURLToPath } from 'url';
+import config from '../config/config.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const LOG_FILE = process.env.REQUEST_LOG_FILE
-  ? path.resolve(process.env.REQUEST_LOG_FILE)
+const LOG_FILE = config.logging.requestLogFile
+  ? path.resolve(config.logging.requestLogFile)
   : path.join(__dirname, '..', '..', 'data', 'request_logs.json');
-const DETAIL_DIR = process.env.REQUEST_LOG_DETAIL_DIR
-  ? path.resolve(process.env.REQUEST_LOG_DETAIL_DIR)
+const DETAIL_DIR = config.logging.requestLogDetailDir
+  ? path.resolve(config.logging.requestLogDetailDir)
   : path.join(path.dirname(LOG_FILE), 'request_logs');
 
-const MAX_LOGS = Number.isFinite(Number(process.env.REQUEST_LOG_MAX_ITEMS))
-  ? Number(process.env.REQUEST_LOG_MAX_ITEMS)
-  : 5000;
-
-const RETENTION_DAYS = Number.isFinite(Number(process.env.REQUEST_LOG_RETENTION_DAYS))
-  ? Math.max(1, Number(process.env.REQUEST_LOG_RETENTION_DAYS))
-  : 7;
+const MAX_LOGS = config.logging.requestLogMaxItems;
+const RETENTION_DAYS = Math.max(1, config.logging.requestLogRetentionDays);
 const LOG_RETENTION_MS = RETENTION_DAYS * 24 * 60 * 60 * 1000;
+
+function getLogLevel() {
+  const raw = (config.logging.requestLogLevel || '').toLowerCase();
+  if (raw === 'off' || raw === 'error' || raw === 'all') return raw;
+  return 'all';
+}
+
+function shouldLogEntry(entry) {
+  const level = getLogLevel();
+  if (level === 'off') return false;
+  if (level === 'error') {
+    const status = Number(entry?.status);
+    const success = entry?.success;
+    const isErrorStatus = Number.isFinite(status) && status >= 400;
+    const isFailed = success === false;
+    return isErrorStatus || isFailed;
+  }
+  return true;
+}
 
 function parseTimestamp(value) {
   const parsed = Date.parse(value || '');
@@ -155,6 +170,10 @@ export function readLogs() {
 }
 
 export function appendLog(entry) {
+  if (!entry || !shouldLogEntry(entry)) {
+    return null;
+  }
+
   const { detail, ...rest } = entry || {};
   const timestamp = rest?.timestamp || new Date().toISOString();
   const id = rest?.id || randomUUID();
@@ -273,5 +292,56 @@ export function getUsageSummary() {
   });
 
   return summary;
+}
+
+export function clearLogs() {
+  try {
+    // 根据索引文件记录的 detailRef 做一次定向清理
+    if (fs.existsSync(LOG_FILE)) {
+      try {
+        const raw = fs.readFileSync(LOG_FILE, 'utf-8');
+        const data = JSON.parse(raw);
+        if (Array.isArray(data)) {
+          data.forEach(entry => {
+            if (entry && entry.detailRef) {
+              deleteDetail(entry.detailRef);
+            }
+          });
+        }
+      } catch {
+        // 索引解析失败直接忽略，继续做兜底清理
+      }
+
+      try {
+        fs.unlinkSync(LOG_FILE);
+      } catch {
+        // 索引删除失败不影响后续清理
+      }
+    }
+
+    // 兜底：清空详情目录中的所有文件，防止历史残留
+    if (fs.existsSync(DETAIL_DIR)) {
+      try {
+        const files = fs.readdirSync(DETAIL_DIR);
+        files.forEach(name => {
+          const filePath = path.join(DETAIL_DIR, name);
+          try {
+            const stat = fs.statSync(filePath);
+            if (stat.isFile()) {
+              fs.unlinkSync(filePath);
+            }
+          } catch {
+            // 单个文件删除失败不影响整体
+          }
+        });
+      } catch {
+        // 目录读取异常可忽略
+      }
+    }
+
+    return true;
+  } catch {
+    return false;
+  }
 }
 

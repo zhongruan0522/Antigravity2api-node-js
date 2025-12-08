@@ -22,6 +22,27 @@ if (config.useNativeAxios === true) {
     }
 }
 
+export function refreshApiClientConfig() {
+    if (config.useNativeAxios === true) {
+        requester = null;
+        useAxios = true;
+        return;
+    }
+
+    if (config.useNativeAxios === false) {
+        useAxios = false;
+    }
+
+    if (!requester && !useAxios) {
+        try {
+            requester = new AntigravityRequester();
+        } catch (error) {
+            console.warn('重新初始化 AntigravityRequester 失败，继续使用 axios:', error.message);
+            useAxios = true;
+        }
+    }
+}
+
 // ==================== 辅助函数 ====================
 
 function buildHeaders(token) {

@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
+
 <head>
   <meta charset="utf-8" />
   <title>Antigravity OAuth 管理</title>
@@ -7,11 +8,12 @@
     try {
       const saved = localStorage.getItem('ag-panel-theme');
       if (saved) document.documentElement.setAttribute('data-theme', saved);
-    } catch (e) {}
+    } catch (e) { }
   </script>
   <link rel="stylesheet" href="/admin/panel.css" />
   <script src="/admin/theme.js"></script>
 </head>
+
 <body>
   <div class="container">
     <header class="header">
@@ -47,21 +49,11 @@
       </div>
       <div class="card-body">
         <p>授权完成后，请复制回调页面地址栏中的完整 URL，粘贴到输入框并提交以完成添加或重新授权。</p>
-        <input
-          id="callbackUrlInput"
-          type="text"
-          placeholder="将回调后浏览器真实的完整 URL 粘贴到这里"
-          class="input"
-        />
+        <input id="callbackUrlInput" type="text" placeholder="将回调后浏览器真实的完整 URL 粘贴到这里" class="input" />
         <div class="project-id-section">
           <label class="project-id-label">
             <span>自定义项目 ID（可选）</span>
-            <input
-              id="customProjectIdInput"
-              type="text"
-              placeholder="输入自定义项目ID，留空则自动获取"
-              class="input"
-            />
+            <input id="customProjectIdInput" type="text" placeholder="输入自定义项目ID，留空则自动获取" class="input" />
           </label>
         </div>
         <label class="checkbox-row">
@@ -86,12 +78,8 @@
       </div>
       <div class="card-body">
         <p>将包含 <code>[[accounts]]</code> 的 TOML 内容粘贴到下方，必要时勾选覆盖现有凭证。</p>
-        <textarea
-          id="tomlInput"
-          class="textarea"
-          rows="8"
-          placeholder="[[accounts]]\naccess_token = \"...\"\nrefresh_token = \"...\"\ncreated_at = \"2025-11-26 08:46:35\"\n..."
-        ></textarea>
+        <textarea id="tomlInput" class="textarea" rows="8" placeholder="[[accounts]]\naccess_token = \"
+          ...\"\nrefresh_token=\"...\"\ncreated_at=\"2025-11-26 08:46:35\"\n..."></textarea>
         <label class="checkbox-row">
           <input type="checkbox" id="replaceExisting" />
           <span>覆盖已存在的账号（勾选后将只保留本次导入的账号）</span>
@@ -164,7 +152,7 @@
         <div class="log-usage-head">
           <div>
             <div class="eyebrow">每小时用量</div>
-            <h3>凭证 20 次 / 小时 限额</h3>
+            <h3>默认凭证 20 次 / 小时 限额，可以前往设置修改</h3>
             <p>按浏览器时区计算当前小时的调用占比。</p>
           </div>
         </div>
@@ -179,7 +167,10 @@
           <h2>调用日志</h2>
           <p>精确到秒，记录使用的模型以及调用结果。</p>
         </div>
-        <button id="logsRefreshBtn" class="refresh-btn">🔄 刷新日志</button>
+        <div class="card-actions">
+          <button id="logsRefreshBtn" class="refresh-btn">🔄 刷新日志</button>
+          <button id="logsClearBtn" class="refresh-btn">🗑 清空日志</button>
+        </div>
       </div>
       <div class="logs-body">
         <div class="pagination-bar logs-pagination">
@@ -235,7 +226,8 @@
       </div>
       <div class="card-body">
         <div class="project-content">
-          <p>当前项目是基于<a href="https://github.com/liuw1535">liuw1535</a>大佬的<a href="https://github.com/liuw1535/antigravity2api-nodejs">antigravity2api-nodejs</a>做的修改和迭代</p>
+          <p>当前项目是基于<a href="https://github.com/liuw1535">liuw1535</a>大佬的<a
+              href="https://github.com/liuw1535/antigravity2api-nodejs">antigravity2api-nodejs</a>做的修改和迭代</p>
           <p>二开项目QQ交流群： <a href="https://qm.qq.com/q/J0Ny6uYZCo">937931004</a></p>
         </div>
       </div>
@@ -244,4 +236,5 @@
 
   <script src="/admin/panel.js"></script>
 </body>
+
 </html>

@@ -5,13 +5,8 @@ import config from '../config/config.js';
 // OAuth client configuration is shared between CLI login script and HTTP server.
 // For now we keep the built‑in defaults and allow overriding via env when needed.
 
-export const CLIENT_ID =
-  process.env.GOOGLE_CLIENT_ID ||
-  '1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com';
-
-export const CLIENT_SECRET =
-  process.env.GOOGLE_CLIENT_SECRET ||
-  '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';
+export const CLIENT_ID = config.oauth.clientId;
+export const CLIENT_SECRET = config.oauth.clientSecret;
 
 export const SCOPES = [
   'https://www.googleapis.com/auth/cloud-platform',

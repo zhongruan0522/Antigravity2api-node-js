@@ -6,6 +6,7 @@ const listEl = document.getElementById('accountsList');
 const refreshBtn = document.getElementById('refreshBtn');
 const refreshAllBtn = document.getElementById('refreshAllBtn');
 const logsRefreshBtn = document.getElementById('logsRefreshBtn');
+const logsClearBtn = document.getElementById('logsClearBtn');
 const hourlyUsageEl = document.getElementById('hourlyUsage');
 const manageStatusEl = document.getElementById('manageStatus');
 const callbackUrlInput = document.getElementById('callbackUrlInput');
@@ -49,6 +50,7 @@ let statusFilter = 'all';
 let errorOnly = false;
 const logDetailCache = new Map();
 
+let logLevelSelect = null;
 let replaceIndex = null;
 
 if (window.AgTheme) {
@@ -459,6 +461,7 @@ function renderSettings(groups) {
       const items = (group.items || [])
         .map(item => {
           const currentValue = item?.value ?? '未设置';
+          const editableValue = item.sensitive ? '' : currentValue;
           const defaultValue = item?.defaultValue ?? '无默认值';
 
           // 显示格式：如果设置了环境变量，显示"环境变量值 (默认值: 默认值)"
@@ -467,14 +470,23 @@ function renderSettings(groups) {
             : `${currentValue} ${defaultValue !== '无默认值' ? `(默认值: ${defaultValue})` : ''}`;
 
           const badges = [
-            `<span class="chip ${item.isDefault ? '' : 'chip-success'}">${item.isDefault ? '默认值' : '环境变量'}</span>`,
-            item.sensitive ? '<span class="chip chip-warning">敏感信息</span>' : ''
+            `<span class="chip ${item.isDefault ? '' : item.source === 'docker' ? 'chip-warning' : item.source === 'env' ? 'chip-info' : 'chip-success'}">${
+              item.isDefault ? '默认值' :
+              item.source === 'docker' ? 'Docker环境变量' :
+              item.source === 'env' ? '环境变量' :
+              '配置文件'
+            }</span>`,
+            item.sensitive ? '<span class="chip chip-warning">敏感信息</span>' : '',
+            item.dockerOnly ? '<span class="chip chip-warning">Docker专用</span>' : ''
           ]
             .filter(Boolean)
             .join('');
 
           const metaParts = [
-            item.isDefault ? '使用默认值' : '来自环境变量',
+            item.isDefault ? '使用默认值' :
+              item.source === 'docker' ? '来自Docker环境变量' :
+              item.source === 'env' ? '来自环境变量' :
+              '来自data/config.json文件',
             `环境变量名: ${item.key}`,
             item.description ? escapeHtml(item.description) : ''
           ]
@@ -489,6 +501,17 @@ function renderSettings(groups) {
               </div>
               <div class="setting-value">${escapeHtml(displayValue)}</div>
               <div class="setting-meta">${metaParts}</div>
+              <div class="setting-actions">
+                <button
+                  class="mini-btn setting-edit-btn"
+                  data-key="${escapeHtml(item.key)}"
+                  data-label="${escapeHtml(item.label || item.key)}"
+                  data-sensitive="${item.sensitive ? 'true' : 'false'}"
+                  data-current="${escapeHtml(String(editableValue ?? ''))}"
+                >
+                  ✏️ 修改
+                </button>
+              </div>
             </div>
           `;
         })
@@ -519,6 +542,103 @@ async function loadSettings() {
     settingsGrid.textContent = '加载设置失败: ' + e.message;
     setStatus('刷新失败: ' + e.message, 'error', settingsStatusEl);
   }
+}
+
+async function updateSettingValue({ key, label, isSensitive, currentValue }) {
+  if (!key) return;
+
+  const promptMessage = [
+    `${label || key} (${key})`,
+    '留空可回退到默认值，更新后会立即保存到 data/config.json。',
+    isSensitive ? '敏感信息不会显示当前值，请直接输入新值。' : null
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  const newValue = window.prompt(promptMessage, isSensitive ? '' : currentValue || '');
+  if (newValue === null) return;
+
+  try {
+    setStatus('保存配置中...', 'info', settingsStatusEl);
+    const response = await fetchJson('/admin/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key, value: newValue })
+    });
+
+    if (response.dockerOnly) {
+      // Docker专用配置的特殊提示
+      setStatus(`此配置为 Docker 专用，请在 docker-compose.yml 的 environment 部分修改。`, 'warning', settingsStatusEl);
+      alert(`⚠️ ${response.error}\n\n请在 docker-compose.yml 的 environment 部分修改此配置：\n${key}=你的值`);
+    } else {
+      await loadSettings();
+      setStatus('已保存到 data/config.json。', 'success', settingsStatusEl);
+    }
+  } catch (e) {
+    setStatus('更新失败: ' + e.message, 'error', settingsStatusEl);
+  }
+}
+
+async function loadLogSettings() {
+  if (!logLevelSelect) return;
+  try {
+    const data = await fetchJson('/admin/logs/settings');
+    const raw = (data.level || 'all').toLowerCase();
+    logLevelSelect.value = ['off', 'error', 'all'].includes(raw) ? raw : 'all';
+  } catch (e) {
+    console.error('加载调用日志配置失败:', e);
+  }
+}
+
+function initLogSettingsUI() {
+  const logsHeader = document.querySelector('[data-tab="logs"] .card-header');
+  if (!logsHeader || !logsRefreshBtn) return;
+
+  if (logLevelSelect) {
+    loadLogSettings();
+    return;
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'card-actions';
+
+  const label = document.createElement('label');
+  label.className = 'setting-inline';
+  label.style.display = 'flex';
+  label.style.alignItems = 'center';
+  label.style.gap = '8px';
+
+  const span = document.createElement('span');
+  span.textContent = '调用日志级别';
+
+
+  label.appendChild(span);
+  label.appendChild(select);
+  actions.appendChild(label);
+
+  logsHeader.removeChild(logsRefreshBtn);
+  actions.appendChild(logsRefreshBtn);
+  logsHeader.appendChild(actions);
+
+  logLevelSelect = select;
+
+  logLevelSelect.addEventListener('change', async () => {
+    const level = logLevelSelect.value;
+    try {
+      setStatus('正在更新调用日志设置...', 'info', statusEl);
+      await fetchJson('/admin/logs/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ level })
+      });
+      setStatus('调用日志设置已更新', 'success', statusEl);
+      await loadLogs();
+    } catch (e) {
+      setStatus('更新调用日志设置失败: ' + e.message, 'error', statusEl);
+    }
+  });
+
+  loadLogSettings();
 }
 
 async function loadLogs() {
@@ -1042,6 +1162,31 @@ if (logsRefreshBtn) {
   });
 }
 
+if (logsClearBtn) {
+  logsClearBtn.addEventListener('click', async () => {
+    if (!confirm('确认清空所有调用日志吗？该操作不可恢复。')) return;
+
+    try {
+      logsClearBtn.disabled = true;
+      logsClearBtn.textContent = '清空中...';
+      await fetchJson('/admin/logs/clear', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      setStatus('调用日志已清空', 'success', statusEl);
+      logsData = [];
+      logCurrentPage = 1;
+      renderLogs();
+      await loadHourlyUsage();
+    } catch (e) {
+      setStatus('清空日志失败: ' + e.message, 'error', statusEl);
+    } finally {
+      logsClearBtn.textContent = '🗑 清空日志';
+      logsClearBtn.disabled = false;
+    }
+  });
+}
+
 if (usageRefreshBtn) {
   usageRefreshBtn.addEventListener('click', async () => {
     try {
@@ -1071,7 +1216,22 @@ if (settingsRefreshBtn) {
   });
 }
 
+if (settingsGrid) {
+  settingsGrid.addEventListener('click', async event => {
+    const target = event.target.closest('.setting-edit-btn');
+    if (!target) return;
+
+    await updateSettingValue({
+      key: target.dataset.key,
+      label: target.dataset.label,
+      isSensitive: target.dataset.sensitive === 'true',
+      currentValue: target.dataset.current
+    });
+  });
+}
+
 refreshAccounts();
 loadLogs();
 loadHourlyUsage();
 loadSettings();
+initLogSettingsUI();

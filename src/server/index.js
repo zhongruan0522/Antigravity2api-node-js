@@ -10,12 +10,19 @@ import {
   getAvailableModels,
   closeRequester,
   generateGeminiContent,
-  streamGeminiContent
+  streamGeminiContent,
+  refreshApiClientConfig
 } from '../api/client.js';
 import { generateRequestBody } from '../utils/utils.js';
 import { generateProjectId } from '../utils/idGenerator.js';
 import logger from '../utils/logger.js';
-import config from '../config/config.js';
+import {
+  loadDataConfig,
+  getEffectiveConfig as getEffectiveDataConfig,
+  isDockerOnlyKey,
+  getDockerOnlyKeys
+} from '../config/dataConfig.js';
+import config, { updateEnvValues } from '../config/config.js';
 import tokenManager from '../auth/token_manager.js';
 import { buildAuthUrl, exchangeCodeForToken } from '../auth/oauth_client.js';
 import { resolveProjectIdFromAccessToken, fetchUserEmail } from '../auth/project_id_resolver.js';
@@ -24,7 +31,8 @@ import {
   getLogDetail,
   getRecentLogs,
   getUsageCountsWithinWindow,
-  getUsageSummary
+  getUsageSummary,
+  clearLogs
 } from '../utils/log_store.js';
 import quotaManager from '../auth/quota_manager.js';
 
@@ -34,10 +42,16 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const ACCOUNTS_FILE = path.join(__dirname, '..', '..', 'data', 'accounts.json');
 const OAUTH_STATE = crypto.randomUUID();
-const PANEL_USER = process.env.PANEL_USER || null;
-const PANEL_PASSWORD = process.env.PANEL_PASSWORD || null;
 const PANEL_SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 管理面板登录有效期：2 小时
 const SENSITIVE_HEADERS = ['authorization', 'cookie'];
+
+function getPanelUser() {
+  return config.panelUser || 'admin';
+}
+
+function isPanelPasswordConfigured() {
+  return !!config.panelPassword;
+}
 
 function sanitizeHeaders(headers = {}) {
   const result = {};
@@ -86,31 +100,54 @@ function maskSecret(value) {
   return `${str.slice(0, 2)}${'*'.repeat(Math.max(4, str.length - 4))}${str.slice(-2)}`;
 }
 
-function buildSettingsSummary() {
+function buildSettingsSummary(configSnapshot = config) {
+  const dataConfig = getEffectiveDataConfig();
+  const configSource = configSnapshot || config;
   const groups = new Map();
 
   SETTINGS_DEFINITIONS.forEach(def => {
+    // 使用统一配置获取逻辑，而不是直接读取process.env
     const envValue = process.env[def.key];
+    const dataValue = dataConfig[def.key];
     const envNormalized = normalizeValue(envValue);
+    const dataNormalized = normalizeValue(dataValue);
     const defaultNormalized = normalizeValue(def.defaultValue ?? null);
-    const resolved = normalizeValue(def.valueResolver ? def.valueResolver() : envValue ?? def.defaultValue);
 
-    const isDefault =
-      envValue === undefined ||
-      envValue === null ||
-      envValue === '' ||
-      (defaultNormalized !== null && envNormalized === String(defaultNormalized));
+    // 判断配置来源：Docker环境变量 > data文件 > 默认值
+    let source = 'default';
+    let resolved = defaultNormalized;
+
+    // Docker专用配置只能从环境变量读取
+    if (isDockerOnlyKey(def.key)) {
+      if (envValue !== undefined && envValue !== null && envValue !== '') {
+        source = 'docker';
+        resolved = normalizeValue(envValue);
+      }
+    } else {
+      // 其他配置：data文件 > 默认值 (环境变量只是用于展示，不覆盖实际生效值)
+      if (dataValue !== undefined && dataValue !== null && dataValue !== '') {
+        source = 'file';
+        resolved = dataNormalized;
+      } else if (envValue !== undefined && envValue !== null && envValue !== '') {
+        // 只有当data文件中没有值时才显示环境变量
+        source = 'env';
+        resolved = normalizeValue(envValue);
+      }
+    }
+
+    const isDefault = source === 'default';
 
     const item = {
       key: def.key,
       label: def.label || def.key,
       value: def.sensitive ? maskSecret(resolved) : resolved,
       defaultValue: defaultNormalized,
-      source: isDefault ? 'default' : 'env',
+      source,
       sensitive: !!def.sensitive,
       isDefault,
       isMissing: resolved === null,
-      description: def.description || ''
+      description: def.description || '',
+      dockerOnly: isDockerOnlyKey(def.key) // 标记是否为Docker专用配置
     };
 
     const groupName = def.category || '未分组';
@@ -125,11 +162,39 @@ function buildSettingsSummary() {
 
 const SETTINGS_DEFINITIONS = [
   {
+    key: 'CREDENTIAL_MAX_USAGE_PER_HOUR',
+    label: '凭证每小时调用上限',
+    category: '限额与重试',
+    defaultValue: 20,
+    valueResolver: cfg => cfg.credentials.maxUsagePerHour
+  },
+  {
+    key: 'REQUEST_LOG_LEVEL',
+    label: '调用日志级别',
+    category: '调用日志',
+    defaultValue: 'all',
+    valueResolver: cfg => cfg.logging.requestLogLevel
+  },
+  {
+    key: 'REQUEST_LOG_MAX_ITEMS',
+    label: '调用日志最大保留条数',
+    category: '调用日志',
+    defaultValue: 200,
+    valueResolver: cfg => cfg.logging.requestLogMaxItems
+  },
+  {
+    key: 'REQUEST_LOG_RETENTION_DAYS',
+    label: '调用日志保留天数',
+    category: '调用日志',
+    defaultValue: 7,
+    valueResolver: cfg => cfg.logging.requestLogRetentionDays
+  },
+  {
     key: 'PANEL_USER',
     label: '面板登录用户名',
     category: '面板与安全',
     defaultValue: 'admin',
-    valueResolver: () => PANEL_USER || 'admin'
+    valueResolver: () => getPanelUser()
   },
   {
     key: 'PANEL_PASSWORD',
@@ -137,7 +202,7 @@ const SETTINGS_DEFINITIONS = [
     category: '面板与安全',
     defaultValue: null,
     sensitive: true,
-    valueResolver: () => (PANEL_PASSWORD ? '已配置' : null),
+    valueResolver: () => (isPanelPasswordConfigured() ? '已配置' : null),
     description: '用于保护管理界面，未配置将拒绝启动'
   },
   {
@@ -146,7 +211,7 @@ const SETTINGS_DEFINITIONS = [
     category: '面板与安全',
     defaultValue: null,
     sensitive: true,
-    valueResolver: () => process.env.API_KEY || null,
+    valueResolver: cfg => cfg.security.apiKey || null,
     description: '保护 /v1/* 端点的访问'
   },
   {
@@ -154,21 +219,21 @@ const SETTINGS_DEFINITIONS = [
     label: '最大请求体',
     category: '面板与安全',
     defaultValue: '50mb',
-    valueResolver: () => config.security.maxRequestSize
+    valueResolver: cfg => cfg.security.maxRequestSize
   },
   {
     key: 'PORT',
     label: '服务端口',
     category: '服务与网络',
     defaultValue: 8045,
-    valueResolver: () => config.server.port
+    valueResolver: cfg => cfg.server.port
   },
   {
     key: 'HOST',
     label: '监听地址',
     category: '服务与网络',
     defaultValue: '0.0.0.0',
-    valueResolver: () => process.env.HOST || config.server.host
+    valueResolver: cfg => cfg.server.host,
   },
   {
     key: 'API_URL',
@@ -176,14 +241,14 @@ const SETTINGS_DEFINITIONS = [
     category: '服务与网络',
     defaultValue:
       'https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:streamGenerateContent?alt=sse',
-    valueResolver: () => config.api.url
+    valueResolver: cfg => cfg.api.url
   },
   {
     key: 'API_MODELS_URL',
     label: '模型列表 URL',
     category: '服务与网络',
     defaultValue: 'https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels',
-    valueResolver: () => config.api.modelsUrl
+    valueResolver: cfg => cfg.api.modelsUrl
   },
   {
     key: 'API_NO_STREAM_URL',
@@ -191,139 +256,148 @@ const SETTINGS_DEFINITIONS = [
     category: '服务与网络',
     defaultValue:
       'https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:generateContent',
-    valueResolver: () => config.api.noStreamUrl
+    valueResolver: cfg => cfg.api.noStreamUrl
   },
   {
     key: 'API_HOST',
     label: 'API Host 头',
     category: '服务与网络',
     defaultValue: 'daily-cloudcode-pa.sandbox.googleapis.com',
-    valueResolver: () => config.api.host
+    valueResolver: cfg => cfg.api.host
   },
   {
     key: 'API_USER_AGENT',
     label: 'User-Agent',
     category: '服务与网络',
     defaultValue: 'antigravity/1.11.3 windows/amd64',
-    valueResolver: () => config.api.userAgent
+    valueResolver: cfg => cfg.api.userAgent
   },
   {
     key: 'PROXY',
     label: 'HTTP 代理',
     category: '服务与网络',
     defaultValue: null,
-    valueResolver: () => config.proxy
+    valueResolver: cfg => cfg.proxy
   },
   {
     key: 'TIMEOUT',
     label: '请求超时(ms)',
     category: '服务与网络',
     defaultValue: 180000,
-    valueResolver: () => config.timeout
+    valueResolver: cfg => cfg.timeout
   },
   {
     key: 'USE_NATIVE_AXIOS',
     label: '使用原生 Axios',
     category: '服务与网络',
     defaultValue: 'false',
-    valueResolver: () => config.useNativeAxios
+    valueResolver: cfg => cfg.useNativeAxios
   },
   {
     key: 'DEFAULT_TEMPERATURE',
     label: '默认温度',
     category: '生成参数',
     defaultValue: 1,
-    valueResolver: () => config.defaults.temperature
+    valueResolver: cfg => cfg.defaults.temperature
   },
   {
     key: 'DEFAULT_TOP_P',
     label: '默认 top_p',
     category: '生成参数',
     defaultValue: 0.85,
-    valueResolver: () => config.defaults.top_p
+    valueResolver: cfg => cfg.defaults.top_p
   },
   {
     key: 'DEFAULT_TOP_K',
     label: '默认 top_k',
     category: '生成参数',
     defaultValue: 50,
-    valueResolver: () => config.defaults.top_k
+    valueResolver: cfg => cfg.defaults.top_k
   },
   {
     key: 'DEFAULT_MAX_TOKENS',
     label: '默认最大 Tokens',
     category: '生成参数',
     defaultValue: 8096,
-    valueResolver: () => config.defaults.max_tokens
+    valueResolver: cfg => cfg.defaults.max_tokens
   },
   {
     key: 'SYSTEM_INSTRUCTION',
     label: '系统提示词',
     category: '生成参数',
     defaultValue: '',
-    valueResolver: () => config.systemInstruction
+    valueResolver: cfg => cfg.systemInstruction
   },
   {
     key: 'CREDENTIAL_MAX_USAGE_PER_HOUR',
     label: '凭证每小时调用上限',
     category: '限额与重试',
     defaultValue: 20,
-    valueResolver: () => config.credentials.maxUsagePerHour
+    valueResolver: cfg => cfg.credentials.maxUsagePerHour
   },
   {
     key: 'RETRY_STATUS_CODES',
     label: '重试状态码',
     category: '限额与重试',
     defaultValue: '429,500',
-    valueResolver: () => config.retry.statusCodes
+    valueResolver: cfg => cfg.retry.statusCodes
   },
   {
     key: 'RETRY_MAX_ATTEMPTS',
     label: '最大重试次数',
     category: '限额与重试',
     defaultValue: 3,
-    valueResolver: () => config.retry.maxAttempts
+    valueResolver: cfg => cfg.retry.maxAttempts
   },
   {
     key: 'MAX_IMAGES',
     label: '图片保存上限',
     category: '限额与重试',
     defaultValue: 10,
-    valueResolver: () => config.maxImages
+    valueResolver: cfg => cfg.maxImages
   },
   {
     key: 'IMAGE_BASE_URL',
     label: '图片访问基础 URL',
     category: '限额与重试',
     defaultValue: null,
-    valueResolver: () => config.imageBaseUrl
+    valueResolver: cfg => cfg.imageBaseUrl
   }
 ];
 
+const SETTINGS_MAP = new Map(SETTINGS_DEFINITIONS.map(def => [def.key, def]));
+
+function buildSettingsPayload(configSnapshot = config) {
+  return {
+    updatedAt: new Date().toISOString(),
+    groups: buildSettingsSummary(configSnapshot)
+  };
+}
+
 // 为了防止误配置导致管理面板完全裸露，这里强制要求配置 PANEL_PASSWORD
-if (!PANEL_PASSWORD) {
+if (!config.panelPassword) {
   logger.error(
-    'PANEL_PASSWORD 环境变量未配置，出于安全考虑服务将不会启动，请在 .env 或环境变量中设置 PANEL_PASSWORD。'
+    'PANEL_PASSWORD 环境变量未配置，出于安全考虑服务将不会启动，请在 Docker 环境变量中设置 PANEL_PASSWORD。'
   );
   process.exit(1);
 }
 
 // 启动时校验必须存在的环境变量，防止无认证暴露
-if (!process.env.PANEL_USER) {
+if (!config.panelUser) {
   logger.error(
-    'PANEL_USER 环境变量未配置，出于安全考虑服务将不会启动，请在 .env 或环境变量中设置 PANEL_USER。'
+    'PANEL_USER 环境变量未配置，出于安全考虑服务将不会启动，请在 Docker 环境变量中设置 PANEL_USER。'
   );
   process.exit(1);
 }
 
-if (!process.env.API_KEY) {
+if (!config.security.apiKey) {
   logger.error(
-    'API_KEY 环境变量未配置，出于安全考虑服务将不会启动，请在 .env 或环境变量中设置 API_KEY。'
+    'API_KEY 环境变量未配置，出于安全考虑服务将不会启动，请在 Docker 环境变量中设置 API_KEY。'
   );
   process.exit(1);
 }
 
-const PANEL_AUTH_ENABLED = !!PANEL_PASSWORD;
+const PANEL_AUTH_ENABLED = isPanelPasswordConfigured();
 // 使用内存 Map 保存会话：token -> 过期时间戳
 const panelSessions = new Map();
 
@@ -383,11 +457,11 @@ app.use((req, res, next) => {
     const start = Date.now();
     res.on('finish', () => {
       const clientIP = req.headers['x-forwarded-for'] ||
-                      req.headers['x-real-ip'] ||
-                      req.connection?.remoteAddress ||
-                      req.socket?.remoteAddress ||
-                      req.ip ||
-                      'unknown';
+        req.headers['x-real-ip'] ||
+        req.connection?.remoteAddress ||
+        req.socket?.remoteAddress ||
+        req.ip ||
+        'unknown';
       const userAgent = req.headers['user-agent'] || '';
       logger.request(req.method, req.path, res.statusCode, Date.now() - start, clientIP, userAgent);
     });
@@ -473,13 +547,13 @@ function isPanelAuthed(req) {
 }
 
 function requirePanelAuthPage(req, res, next) {
-  if (!PANEL_AUTH_ENABLED) return next();
+  if (!isPanelPasswordConfigured()) return next();
   if (isPanelAuthed(req)) return next();
   return res.redirect('/admin/login');
 }
 
 function requirePanelAuthApi(req, res, next) {
-  if (!PANEL_AUTH_ENABLED) return next();
+  if (!isPanelPasswordConfigured()) return next();
   if (isPanelAuthed(req)) return next();
   return res.status(401).json({ error: 'Unauthorized' });
 }
@@ -639,7 +713,7 @@ app.get('/admin/login', (req, res) => {
       <p>登录后即可进入控制台进行授权、查看用量和配置。</p>
       <form class="login-form" method="POST" action="/admin/login">
         <label>用户名
-          <input name="username" autocomplete="username" value="${process.env.PANEL_USER || 'admin'}" />
+          <input name="username" autocomplete="username" value="${config.panelUser || 'admin'}" />
         </label>
         <label>密码
           <input type="password" name="password" autocomplete="current-password" />
@@ -669,7 +743,7 @@ app.post('/admin/login', (req, res) => {
   }
 
   const { username, password } = req.body || {};
-  if (username === PANEL_USER && password === PANEL_PASSWORD) {
+  if (username === getPanelUser() && password === config.panelPassword) {
     const token = crypto.randomBytes(24).toString('hex');
     const expiresAt = Date.now() + PANEL_SESSION_TTL_MS;
     panelSessions.set(token, expiresAt);
@@ -710,32 +784,32 @@ app.post('/admin/logout', (req, res) => {
 
 // Return Google OAuth URL as JSON for front-end
 // 前端现在采用“手动粘贴回调 URL”模式，这里仍然返回带 redirect_uri 的完整授权链接
-  app.get('/auth/oauth/url', requirePanelAuthApi, (req, res) => {
-    const redirectUri = `http://localhost:${config.server.port}/oauth-callback`;
+app.get('/auth/oauth/url', requirePanelAuthApi, (req, res) => {
+  const redirectUri = `http://localhost:${config.server.port}/oauth-callback`;
 
-    const url = buildAuthUrl(redirectUri, OAUTH_STATE);
-    res.json({ url });
-  });
+  const url = buildAuthUrl(redirectUri, OAUTH_STATE);
+  res.json({ url });
+});
 
 // 仅作为提示页面使用：不再在这里直接交换 token
 // 用户在完成授权后，需要复制浏览器地址栏中的完整 URL，回到管理面板粘贴，由新的解析接口处理
 app.get(['/oauth-callback', '/auth/oauth/callback'], (req, res) => {
   return res.send(
     '<!DOCTYPE html>' +
-      '<html lang="zh-CN"><head><meta charset="utf-8" />' +
-      '<title>授权回调 - 请复制地址栏 URL</title>' +
-      '<style>body{font-family:system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#f9fafb;margin:0;padding:24px;color:#111827;}h1{font-size:20px;margin:0 0 12px;}p{margin:6px 0;}code{padding:2px 4px;background:#e5e7eb;border-radius:4px;}</style>' +
-      '</head><body>' +
-      '<h1>授权流程已返回回调地址</h1>' +
-      '<p>请复制当前页面浏览器地址栏中的完整 URL，回到 <code>Antigravity</code> 管理面板，在“粘贴回调 URL”输入框中粘贴并提交。</p>' +
-      '<p>提交后，服务端会解析 URL 中的 <code>code</code> 参数并完成账户添加。</p>' +
-      '</body></html>'
+    '<html lang="zh-CN"><head><meta charset="utf-8" />' +
+    '<title>授权回调 - 请复制地址栏 URL</title>' +
+    '<style>body{font-family:system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#f9fafb;margin:0;padding:24px;color:#111827;}h1{font-size:20px;margin:0 0 12px;}p{margin:6px 0;}code{padding:2px 4px;background:#e5e7eb;border-radius:4px;}</style>' +
+    '</head><body>' +
+    '<h1>授权流程已返回回调地址</h1>' +
+    '<p>请复制当前页面浏览器地址栏中的完整 URL，回到 <code>Antigravity</code> 管理面板，在“粘贴回调 URL”输入框中粘贴并提交。</p>' +
+    '<p>提交后，服务端会解析 URL 中的 <code>code</code> 参数并完成账户添加。</p>' +
+    '</body></html>'
   );
 });
 
 // 解析用户粘贴的回调 URL，交换 code 为 token，写入 accounts.json 并刷新 TokenManager
 app.post('/auth/oauth/parse-url', requirePanelAuthApi, async (req, res) => {
-    const { url, replaceIndex, customProjectId, allowRandomProjectId } = req.body || {};
+  const { url, replaceIndex, customProjectId, allowRandomProjectId } = req.body || {};
 
   if (!url || typeof url !== 'string') {
     return res.status(400).json({ error: 'url 字段必填且必须为字符串' });
@@ -763,71 +837,71 @@ app.post('/auth/oauth/parse-url', requirePanelAuthApi, async (req, res) => {
   // 直接使用构造OAuth链接时相同的 redirectUri，避免不匹配问题
   const redirectUri = `http://localhost:${config.server.port}/oauth-callback`;
 
-    try {
-      const tokenData = await exchangeCodeForToken(code, redirectUri);
+  try {
+    const tokenData = await exchangeCodeForToken(code, redirectUri);
 
-      let projectId = null;
-      let userEmail = null;
-      let projectResolveError = null;
+    let projectId = null;
+    let userEmail = null;
+    let projectResolveError = null;
 
-      // 优先使用用户自定义的项目ID
-      if (customProjectId && typeof customProjectId === 'string' && customProjectId.trim()) {
-        projectId = customProjectId.trim();
-        logger.info(`使用用户自定义项目ID: ${projectId}`);
-      } else if (tokenData?.access_token) {
-        // 自动获取项目ID的逻辑
-        try {
-          // 获取用户邮箱
-          userEmail = await fetchUserEmail(tokenData.access_token);
-          logger.info(`成功获取用户邮箱: ${userEmail}`);
+    // 优先使用用户自定义的项目ID
+    if (customProjectId && typeof customProjectId === 'string' && customProjectId.trim()) {
+      projectId = customProjectId.trim();
+      logger.info(`使用用户自定义项目ID: ${projectId}`);
+    } else if (tokenData?.access_token) {
+      // 自动获取项目ID的逻辑
+      try {
+        // 获取用户邮箱
+        userEmail = await fetchUserEmail(tokenData.access_token);
+        logger.info(`成功获取用户邮箱: ${userEmail}`);
 
-          // 使用更可靠的Resource Manager方法获取项目ID
-          const result = await resolveProjectIdFromAccessToken(tokenData.access_token);
-          if (result.projectId) {
-            projectId = result.projectId;
-            logger.info(`通过Resource Manager获取到项目ID: ${projectId}`);
-          } else {
-            // 备用方案：使用原有的loadCodeAssist方法
-            const loadedProjectId = await tokenManager.fetchProjectId({
-              access_token: tokenData.access_token
-            });
-            if (loadedProjectId !== undefined && loadedProjectId !== null) {
-              projectId = loadedProjectId;
-              logger.info(`备用方案获取到项目ID: ${projectId}`);
-            }
+        // 使用更可靠的Resource Manager方法获取项目ID
+        const result = await resolveProjectIdFromAccessToken(tokenData.access_token);
+        if (result.projectId) {
+          projectId = result.projectId;
+          logger.info(`通过Resource Manager获取到项目ID: ${projectId}`);
+        } else {
+          // 备用方案：使用原有的loadCodeAssist方法
+          const loadedProjectId = await tokenManager.fetchProjectId({
+            access_token: tokenData.access_token
+          });
+          if (loadedProjectId !== undefined && loadedProjectId !== null) {
+            projectId = loadedProjectId;
+            logger.info(`备用方案获取到项目ID: ${projectId}`);
           }
-        } catch (err) {
-          projectResolveError = err;
         }
+      } catch (err) {
+        projectResolveError = err;
       }
+    }
 
-      // 如果无法获取项目ID，尝试使用备用方案
-      if (!projectId && !allowRandomProjectId) {
-        const message =
-          projectResolveError?.message ||
-          '无法自动获取 Google 项目 ID，对应接口的访问可能出现 403 错误，请检查权限和 API 组件，或选择使用随机 projectId 再申请！';
-        return res.status(400).json({ error: message, code: 'PROJECT_ID_MISSING' });
-      }
+    // 如果无法获取项目ID，尝试使用备用方案
+    if (!projectId && !allowRandomProjectId) {
+      const message =
+        projectResolveError?.message ||
+        '无法自动获取 Google 项目 ID，对应接口的访问可能出现 403 错误，请检查权限和 API 组件，或选择使用随机 projectId 再申请！';
+      return res.status(400).json({ error: message, code: 'PROJECT_ID_MISSING' });
+    }
 
-      if (!projectId && allowRandomProjectId) {
-        projectId = generateProjectId();
-        logger.info(`使用随机生成的项目ID: ${projectId}`);
-      }
+    if (!projectId && allowRandomProjectId) {
+      projectId = generateProjectId();
+      logger.info(`使用随机生成的项目ID: ${projectId}`);
+    }
 
-      const account = {
-        access_token: tokenData.access_token,
-        refresh_token: tokenData.refresh_token,
-        expires_in: tokenData.expires_in,
-        timestamp: Date.now()
-      };
+    const account = {
+      access_token: tokenData.access_token,
+      refresh_token: tokenData.refresh_token,
+      expires_in: tokenData.expires_in,
+      timestamp: Date.now()
+    };
 
-      if (projectId) {
-        account.projectId = projectId;
-      }
+    if (projectId) {
+      account.projectId = projectId;
+    }
 
-      if (userEmail) {
-        account.email = userEmail;
-      }
+    if (userEmail) {
+      account.email = userEmail;
+    }
 
     let accounts = [];
     try {
@@ -1108,30 +1182,113 @@ app.post('/auth/accounts/:index/enable', requirePanelAuthApi, (req, res) => {
 });
 
 app.get('/admin/settings', requirePanelAuthApi, (req, res) => {
-  res.json({
-    updatedAt: new Date().toISOString(),
-    groups: buildSettingsSummary()
-  });
+  res.json(buildSettingsPayload());
+});
+
+app.post('/admin/settings', requirePanelAuthApi, (req, res) => {
+  const { key, value } = req.body || {};
+
+  if (!key || typeof key !== 'string') {
+    return res.status(400).json({ error: '缺少 key，无法更新配置' });
+  }
+
+  if (!SETTINGS_MAP.has(key)) {
+    return res.status(400).json({ error: `不支持修改的配置项: ${key}` });
+  }
+
+  // 检查是否为Docker专用配置
+  if (isDockerOnlyKey(key)) {
+    return res.status(400).json({
+      error: `此配置项 ${key} 为 Docker 专用，请在 docker-compose.yml 的 environment 部分修改`,
+      dockerOnly: true
+    });
+  }
+
+  try {
+    const newConfig = updateEnvValues({ [key]: value ?? '' });
+
+    // 特殊配置项的即时处理
+    if (
+      key === 'CREDENTIAL_MAX_USAGE_PER_HOUR' &&
+      typeof tokenManager.setHourlyLimit === 'function'
+    ) {
+      tokenManager.setHourlyLimit(newConfig.credentials.maxUsagePerHour);
+    }
+
+    if (key === 'USE_NATIVE_AXIOS' && typeof refreshApiClientConfig === 'function') {
+      refreshApiClientConfig();
+    }
+
+    return res.json({ success: true, ...buildSettingsPayload(newConfig) });
+  } catch (e) {
+    logger.error('更新环境变量失败', e.message || e);
+    return res.status(500).json({ error: e.message || '更新配置失败' });
+  }
 });
 
 app.get('/admin/panel-config', requirePanelAuthApi, (req, res) => {
-  res.json({ apiKey: process.env.API_KEY || null });
+  res.json({ apiKey: config.security.apiKey || null });
 });
 
 app.get('/admin/logs/usage', requirePanelAuthApi, (req, res) => {
   const windowMinutes = 60;
-  const limitPerCredential = Number.isFinite(Number(config.credentials.maxUsagePerHour))
-    ? Number(config.credentials.maxUsagePerHour)
+  const limitPerCredential = Number.isFinite(Number(tokenManager.hourlyLimit))
+    ? Number(tokenManager.hourlyLimit)
     : null;
   const usage = getUsageCountsWithinWindow(windowMinutes * 60 * 1000);
 
   res.json({ windowMinutes, limitPerCredential, usage, updatedAt: new Date().toISOString() });
 });
 
+// 调用日志配置：仅影响管理面板里的调用日志存储，不影响终端控制台输出
+app.get('/admin/logs/settings', requirePanelAuthApi, (req, res) => {
+  const raw = (config.logging.requestLogLevel || '').toLowerCase();
+  const level = ['off', 'error', 'all'].includes(raw) ? raw : 'all';
+
+  const maxItems = config.logging.requestLogMaxItems;
+  const retentionDays = config.logging.requestLogRetentionDays;
+
+  res.json({
+    level,
+    maxItems,
+    retentionDays
+  });
+});
+
+app.post('/admin/logs/settings', requirePanelAuthApi, (req, res) => {
+  const { level } = req.body || {};
+  const normalized = String(level || 'all').toLowerCase();
+
+  if (!['off', 'error', 'all'].includes(normalized)) {
+    return res.status(400).json({ error: 'REQUEST_LOG_LEVEL 只支持 off / error / all' });
+  }
+
+  try {
+    updateEnvValues({ REQUEST_LOG_LEVEL: normalized });
+    return res.json({ success: true, level: normalized });
+  } catch (e) {
+    logger.error('更新 REQUEST_LOG_LEVEL 失败', e.message || e);
+    return res.status(500).json({ error: e.message || '更新调用日志配置失败' });
+  }
+});
+
 // Recent request logs
 app.get('/admin/logs', requirePanelAuthApi, (req, res) => {
   const limit = req.query.limit ? Number.parseInt(req.query.limit, 10) : 200;
   res.json({ logs: getRecentLogs(limit) });
+});
+
+app.post('/admin/logs/clear', requirePanelAuthApi, (req, res) => {
+  try {
+    const ok = clearLogs();
+    if (!ok) {
+      return res.status(500).json({ error: '清空日志失败' });
+    }
+    return res.json({ success: true });
+  } catch (e) {
+    logger.error('清空调用日志失败:', e.message || e);
+    return res.status(500).json({ error: e.message || '清空日志失败' });
+  }
 });
 
 app.get('/admin/logs/:id', requirePanelAuthApi, (req, res) => {
@@ -1378,11 +1535,11 @@ app.get('/v1/models', async (req, res) => {
   } catch (error) {
     logger.error('获取模型列表失败:', error.message);
     const clientIP = req.headers['x-forwarded-for'] ||
-                    req.headers['x-real-ip'] ||
-                    req.connection?.remoteAddress ||
-                    req.socket?.remoteAddress ||
-                    req.ip ||
-                    'unknown';
+      req.headers['x-real-ip'] ||
+      req.connection?.remoteAddress ||
+      req.socket?.remoteAddress ||
+      req.ip ||
+      'unknown';
     const userAgent = req.headers['user-agent'] || '';
     logger.error(`/v1/models 错误详情 [${clientIP}] ${userAgent}:`, error.message);
     res.status(500).json({ error: error.message });
@@ -1390,8 +1547,8 @@ app.get('/v1/models', async (req, res) => {
 });
 
 app.get('/v1/lits', (req, res) => {
-  const limitPerCredential = Number.isFinite(Number(config.credentials?.maxUsagePerHour))
-    ? Number(config.credentials.maxUsagePerHour)
+  const limitPerCredential = Number.isFinite(Number(tokenManager.hourlyLimit))
+    ? Number(tokenManager.hourlyLimit)
     : null;
   const usageMap = new Map(
     getUsageCountsWithinWindow(60 * 60 * 1000).map(item => [item.projectId, item.count])

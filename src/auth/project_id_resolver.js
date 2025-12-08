@@ -3,7 +3,7 @@ import config from '../config/config.js';
 import logger from '../utils/logger.js';
 
 function getResourceManagerBaseUrl() {
-  const base = process.env.RESOURCE_MANAGER_API_URL || 'https://cloudresourcemanager.googleapis.com';
+  const base = config.resourceManagerApiUrl || 'https://cloudresourcemanager.googleapis.com';
   return base.replace(/\/+$/, '');
 }
 

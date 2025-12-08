@@ -36,6 +36,11 @@ class TokenManager {
     }
   }
 
+  setHourlyLimit(limit) {
+    if (!Number.isFinite(Number(limit))) return;
+    this.hourlyLimit = Number(limit);
+  }
+
   isWithinHourlyLimit(token) {
     if (!this.hourlyLimit || Number.isNaN(this.hourlyLimit)) return true;
 

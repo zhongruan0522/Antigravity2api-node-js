@@ -643,10 +643,10 @@ button:disabled {
   border-color: var(--status-ok-bg);
 }
 
-.chip-warning {
-  background: var(--chip-warning-bg);
-  color: var(--chip-warning-text);
-  border-color: var(--chip-warning-border);
+.chip-info {
+  background: var(--info-bg);
+  color: var(--info-text);
+  border-color: var(--info-bg);
 }
 
 .logs {
@@ -936,6 +936,17 @@ button:disabled {
   flex-wrap: wrap;
 }
 
+.setting-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.setting-actions .mini-btn {
+  padding: 6px 10px;
+}
+
 .chip {
   font-size: 11px;
   padding: 2px 8px;
@@ -951,10 +962,10 @@ button:disabled {
   border-color: var(--status-ok-bg);
 }
 
-.chip-warning {
-  background: var(--chip-warning-bg);
-  color: var(--chip-warning-text);
-  border-color: var(--chip-warning-border);
+.chip-info {
+  background: var(--info-bg);
+  color: var(--info-text);
+  border-color: var(--info-bg);
 }
 
 .setting-item.missing .setting-value {

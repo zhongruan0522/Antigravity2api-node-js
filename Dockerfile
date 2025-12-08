@@ -7,8 +7,10 @@ WORKDIR /app
 # 复制 package.json 和 package-lock.json（如果存在）
 COPY package*.json ./
 
-# 安装项目依赖
-RUN npm ci --only=production && npm cache clean --force
+# 安装项目依赖并清理缓存
+RUN npm ci --only=production && \
+    npm cache clean --force && \
+    rm -rf /root/.npm
 
 # 复制项目文件
 COPY . .
