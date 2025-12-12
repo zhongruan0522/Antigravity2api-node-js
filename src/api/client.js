@@ -403,8 +403,11 @@ function parseAndEmitStreamChunk(line, state, callback) {
         if (parts) {
             for (const part of parts) {
                 if (part.thought === true) {
-                    // 思维链内容 - 不添加标签，直接发送
-                    callback({ type: 'thinking', content: part.text || '' });
+                    // 思维链内容 - 直接发送
+                    if (part.text) {
+                        callback({ type: 'thinking', content: part.text });
+                    }
+                    // 思维阶段的中间图片，跳过（只发送最终图片）
                 } else if (part.text !== undefined) {
                     if (part.thoughtSignature) {
                         registerTextThoughtSignature(part.text, part.thoughtSignature);
@@ -415,6 +418,10 @@ function parseAndEmitStreamChunk(line, state, callback) {
                 } else if (part.functionCall) {
                     // 工具调用
                     state.toolCalls.push(convertToToolCallWithSignature(part.functionCall, part.thoughtSignature));
+                } else if (part.inlineData) {
+                    // 图片数据
+                    const imageUrl = saveBase64Image(part.inlineData.data, part.inlineData.mimeType);
+                    callback({ type: 'image', url: imageUrl });
                 }
             }
         }
@@ -682,19 +689,19 @@ export async function generateAssistantResponseNoStream(requestBody, token) {
         }
     }
 
-    // 拼接思维链标签
-    if (thinkingContent) {
+    // 拼接思维链标签（用于非图像模型的普通响应）
+    if (thinkingContent && imageUrls.length === 0) {
         content = `<think>\n${thinkingContent}\n</think>\n${content}`;
     }
     if (aggregatedText && aggregatedTextSignature) {
         registerTextThoughtSignature(aggregatedText, aggregatedTextSignature);
     }
 
-    // 生图模型：转换为 markdown 格式
+    // 生图模型：转换为 markdown 格式，并返回独立的 thinking 字段
     if (imageUrls.length > 0) {
         let markdown = content ? content + '\n\n' : '';
         markdown += imageUrls.map(url => `![image](${url})`).join('\n\n');
-        return { content: markdown, toolCalls };
+        return { content: markdown, toolCalls, thinking: thinkingContent || null };
     }
 
     return { content, toolCalls, usage };

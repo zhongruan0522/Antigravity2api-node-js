@@ -92,6 +92,43 @@ function logDetail(data) {
 }
 
 /**
+ * 截断 base64 数据，只保留前 maxLength 个字符
+ * @param {any} obj - 要处理的对象
+ * @param {number} maxLength - 最大保留长度，默认 100
+ * @returns {any} - 处理后的对象
+ */
+function truncateBase64(obj, maxLength = 100) {
+  if (obj === null || obj === undefined) {
+    return obj;
+  }
+
+  if (typeof obj === 'string') {
+    // 检测是否为 base64 数据（长度较长且符合 base64 格式）
+    // base64 通常只包含 A-Za-z0-9+/= 字符
+    const base64Regex = /^[A-Za-z0-9+/=]{200,}$/;
+    if (base64Regex.test(obj)) {
+      const totalLength = obj.length;
+      return obj.substring(0, maxLength) + `...[已截断, 共 ${totalLength} 字符]`;
+    }
+    return obj;
+  }
+
+  if (Array.isArray(obj)) {
+    return obj.map(item => truncateBase64(item, maxLength));
+  }
+
+  if (typeof obj === 'object') {
+    const result = {};
+    for (const key of Object.keys(obj)) {
+      result[key] = truncateBase64(obj[key], maxLength);
+    }
+    return result;
+  }
+
+  return obj;
+}
+
+/**
  * 记录后端 API 的请求和响应（仅 debug=high 时生效）
  * @param {Object} data - 日志数据
  * @param {string} data.type - 'request' 或 'response'
@@ -124,7 +161,9 @@ function logBackend(data) {
     }
     if (body) {
       console.log(`${colors.yellow}Body:${colors.reset}`);
-      const bodyStr = typeof body === 'string' ? body : JSON.stringify(body, null, 2);
+      // 截断 base64 数据
+      const truncatedBody = truncateBase64(body);
+      const bodyStr = typeof truncatedBody === 'string' ? truncatedBody : JSON.stringify(truncatedBody, null, 2);
       console.log(bodyStr);
     }
   } else if (type === 'response') {
@@ -132,7 +171,9 @@ function logBackend(data) {
     console.log(`${colors.green}[Backend Response]${colors.reset} ${statusColor}${status}${colors.reset} ${colors.gray}${durationMs}ms${colors.reset}`);
     if (body) {
       console.log(`${colors.green}Body:${colors.reset}`);
-      const bodyStr = typeof body === 'string' ? body : JSON.stringify(body, null, 2);
+      // 截断 base64 数据
+      const truncatedBody = truncateBase64(body);
+      const bodyStr = typeof truncatedBody === 'string' ? truncatedBody : JSON.stringify(truncatedBody, null, 2);
       console.log(bodyStr);
     }
   }

@@ -1605,9 +1605,14 @@ const createChatCompletionHandler = (resolveToken, options = {}) => async (req, 
     const requestBody = generateRequestBody(messages, model, params, tools, token);
 
     if (isImageModel) {
+      // 为图像模型配置思维链和响应模态，使 gemini-3-pro-image 能返回思维内容
       requestBody.request.generationConfig = {
-        candidateCount: 1
-        // imageConfig: { aspectRatio: '1:1' }
+        candidateCount: 1,
+        responseModalities: ["TEXT", "IMAGE"],
+        thinkingConfig: {
+          includeThoughts: true,
+          thinkingBudget: 1024
+        }
       };
       requestBody.requestType = 'image_gen';
       requestBody.request.systemInstruction.parts[0].text +=
@@ -1622,11 +1627,32 @@ const createChatCompletionHandler = (resolveToken, options = {}) => async (req, 
       setStreamHeaders(res);
 
       if (isImageModel) {
-        const { content, usage } = await generateAssistantResponseNoStream(requestBody, token);
-        writeStreamData(res, createStreamChunk(id, created, model, { content }));
+        // 图像模型使用流式API，实现思维链实时传输
+        const imageUrls = [];
+        const { usage } = await generateAssistantResponse(requestBody, token, data => {
+          streamEventsForLog.push(data);
+
+          if (data.type === 'thinking') {
+            // 思维链内容实时发送
+            writeStreamData(res, createStreamChunk(id, created, model, { reasoning_content: data.content }));
+          } else if (data.type === 'image') {
+            // 收集图片URL，最后统一发送
+            imageUrls.push(data.url);
+          } else if (data.type === 'text') {
+            // 文本内容
+            writeStreamData(res, createStreamChunk(id, created, model, { content: data.content }));
+          }
+        });
+
+        // 发送所有图片
+        if (imageUrls.length > 0) {
+          const markdown = imageUrls.map(url => `![image](${url})`).join('\n\n');
+          writeStreamData(res, createStreamChunk(id, created, model, { content: markdown }));
+        }
+
         endStream(res, id, created, model, 'stop', usage);
-        responseBodyForLog = { stream: true, image: true, usage, content };
-        responseSummaryForLog = { text: content };
+        responseBodyForLog = { stream: true, image: true, usage, events: streamEventsForLog };
+        responseSummaryForLog = summarizeStreamEvents(streamEventsForLog);
       } else {
         let hasToolCall = false;
         const { usage } = await generateAssistantResponse(requestBody, token, data => {
