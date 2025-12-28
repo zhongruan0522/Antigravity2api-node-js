@@ -292,6 +292,11 @@ function cleanJsonSchema(schema) {
 
       // 处理 required 数组
       if (cleaned.required && Array.isArray(cleaned.required)) {
+        // 过滤掉 required 中不存在于 properties 的属性
+        if (cleaned.properties && typeof cleaned.properties === 'object') {
+          const validProps = Object.keys(cleaned.properties);
+          cleaned.required = cleaned.required.filter(prop => validProps.includes(prop));
+        }
         // 确保 required 不为空数组
         if (cleaned.required.length === 0) {
           delete cleaned.required;

@@ -1,5 +1,6 @@
 import axios from 'axios';
 import tokenManager from '../auth/token_manager.js';
+import modelCooldownManager from '../auth/model_cooldown_manager.js';
 import config from '../config/config.js';
 import { log } from '../utils/logger.js';
 import { generateRequestId, generateToolCallId } from '../utils/idGenerator.js';
@@ -197,11 +198,31 @@ function detectEmbeddedError(body) {
         const status = statusFromStatusText(errorObj.code || errorObj.status);
         const retryDelayMs = parseRetryDelayMs(errorObj, errorObj.message || body);
 
+        // 提取模型冷却信息
+        let modelCooldown = null;
+        if (status === 429 && errorObj.details && Array.isArray(errorObj.details)) {
+            const errorInfo = errorObj.details.find(
+                detail => typeof detail === 'object' && detail['@type']?.includes('ErrorInfo')
+            );
+            if (errorInfo?.metadata) {
+                const model = errorInfo.metadata.model;
+                const resetTimestamp = errorInfo.metadata.quotaResetTimeStamp;
+                if (model) {
+                    modelCooldown = {
+                        model,
+                        resetTimestamp: resetTimestamp || null,
+                        reason: errorInfo.reason || 'RESOURCE_EXHAUSTED'
+                    };
+                }
+            }
+        }
+
         return {
             status,
             message: JSON.stringify(errorObj, null, 2),
             retryDelayMs,
-            disableToken: status === 401
+            disableToken: status === 401,
+            modelCooldown
         };
     } catch (e) {
         return null;
@@ -213,6 +234,7 @@ async function extractErrorDetails(error) {
     let message = error?.message || error?.response?.statusText || 'Unknown error';
     let retryDelayMs = error?.retryDelayMs || null;
     let disableToken = error?.disableToken === true;
+    let modelCooldown = error?.modelCooldown || null;
 
     if (error?.response?.data?.readable) {
         const chunks = [];
@@ -233,6 +255,7 @@ async function extractErrorDetails(error) {
         status = embeddedError.status ?? status;
         retryDelayMs = embeddedError.retryDelayMs ?? retryDelayMs;
         disableToken = embeddedError.disableToken || disableToken;
+        modelCooldown = embeddedError.modelCooldown ?? modelCooldown;
         message = embeddedError.message;
     }
 
@@ -240,7 +263,8 @@ async function extractErrorDetails(error) {
         status: status ?? 'Unknown',
         message,
         retryDelayMs,
-        disableToken
+        disableToken,
+        modelCooldown
     };
 }
 
@@ -248,7 +272,7 @@ function delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function withRetry(operationFactory, initialToken) {
+async function withRetry(operationFactory, initialToken, requestModel = null) {
     const maxTokenSwitches = Math.max(config.retry?.maxAttempts || 3, 1);
     const retryStatusCodes = config.retry?.statusCodes?.length
         ? config.retry.statusCodes
@@ -258,10 +282,10 @@ async function withRetry(operationFactory, initialToken) {
     let currentToken = initialToken;
     let tokenAttempts = 0; // 当前token的尝试次数
     let tokenSwitches = 0; // 已切换token的次数
-    const triedTokenIds = new Set([currentToken.access_token]);
+    const triedProjectIds = new Set([currentToken.projectId]);
     let lastError = null;
 
-    log.info(`[withRetry] 开始请求，maxTokenSwitches=${maxTokenSwitches}, retryStatusCodes=${retryStatusCodes.join(',')}`);
+    log.info(`[withRetry] 开始请求，maxTokenSwitches=${maxTokenSwitches}, retryStatusCodes=${retryStatusCodes.join(',')}, model=${requestModel || 'unknown'}`);
 
     while (tokenSwitches < maxTokenSwitches) {
         try {
@@ -288,6 +312,76 @@ async function withRetry(operationFactory, initialToken) {
                 throw error;
             }
 
+            // 处理 429 错误中的模型冷却信息
+            if (is429 && details.modelCooldown) {
+                const { model, resetTimestamp, reason } = details.modelCooldown;
+                const cooldownModel = model || requestModel;
+
+                if (cooldownModel && resetTimestamp) {
+                    // 先查询额度，判断是临时限流还是真的耗尽
+                    let quotaRemaining = 0;
+                    try {
+                        const { getModelsWithQuotas } = await import('../api/client.js');
+                        const quotas = await getModelsWithQuotas(currentToken);
+                        const group = modelCooldownManager.getModelGroup ? 
+                            (await import('../auth/model_cooldown_manager.js')).getModelGroup(cooldownModel) : null;
+                        
+                        if (group) {
+                            const { getModelsInGroup } = await import('../auth/model_cooldown_manager.js');
+                            const groupModels = getModelsInGroup(group);
+                            let total = 0, count = 0;
+                            for (const m of groupModels) {
+                                if (quotas[m]) { total += quotas[m].remaining || 0; count++; }
+                            }
+                            quotaRemaining = count > 0 ? total / count : 0;
+                        } else if (quotas[cooldownModel]) {
+                            quotaRemaining = quotas[cooldownModel].remaining || 0;
+                        }
+                    } catch (e) {
+                        log.warn(`[withRetry] 查询额度失败: ${e.message}`);
+                    }
+
+                    // 额度 > 1% 且是首次尝试，等待后重试同一账号
+                    if (quotaRemaining > 0.01 && tokenAttempts === 0) {
+                        tokenAttempts += 1;
+                        const delayMs = Math.min(details.retryDelayMs || 2000, 5000);
+                        log.info(`[withRetry] 额度还有 ${(quotaRemaining * 100).toFixed(1)}%，等待 ${delayMs}ms 后重试同一账号`);
+                        await delay(delayMs);
+                        continue;
+                    }
+
+                    // 额度为0或重试后仍失败，设置冷却并切换账号
+                    await modelCooldownManager.setCooldown(
+                        currentToken.projectId,
+                        cooldownModel,
+                        resetTimestamp,
+                        reason,
+                        currentToken
+                    );
+                    log.info(`[withRetry] 模型 ${cooldownModel} 在账号 ${currentToken.projectId} 上已设置冷却，将于 ${resetTimestamp} 解禁`);
+
+                    // 尝试获取其他有该模型额度的账号
+                    const nextToken = await modelCooldownManager.getAvailableTokenForModel(
+                        cooldownModel,
+                        Array.from(triedProjectIds)
+                    );
+
+                    if (nextToken && !triedProjectIds.has(nextToken.projectId)) {
+                        triedProjectIds.add(nextToken.projectId);
+                        currentToken = nextToken;
+                        tokenAttempts = 0;
+                        tokenSwitches += 1;
+                        log.info(`[withRetry] 已切换到账号 ${nextToken.projectId}，该账号的模型 ${cooldownModel} 未冷却 (第${tokenSwitches}次切换)`);
+                        continue;
+                    } else {
+                        // 所有账号都不可用，返回友好提示
+                        const groupName = (await import('../auth/model_cooldown_manager.js')).getModelGroup(cooldownModel) || cooldownModel;
+                        log.warn(`[withRetry] 所有账号的模型 ${cooldownModel} 都已冷却或尝试过，无法继续`);
+                        throw new Error(`${groupName} 模块下所有账号额度已耗尽，请等待额度重置后再试`);
+                    }
+                }
+            }
+
             tokenAttempts += 1;
 
             // 429错误：当前token已重试1次后，切换到下一个token
@@ -302,12 +396,12 @@ async function withRetry(operationFactory, initialToken) {
                 }
 
                 // 检查是否已经尝试过这个token（避免循环）
-                if (triedTokenIds.has(nextToken.access_token)) {
+                if (triedProjectIds.has(nextToken.projectId)) {
                     log.warn('[withRetry] 所有token都已尝试过，仍然失败');
                     throw error;
                 }
 
-                triedTokenIds.add(nextToken.access_token);
+                triedProjectIds.add(nextToken.projectId);
                 currentToken = nextToken;
                 tokenAttempts = 0;
                 tokenSwitches += 1;

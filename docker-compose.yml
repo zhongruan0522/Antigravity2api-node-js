@@ -1,6 +1,7 @@
 version: '3.8'
 services:
   antigravity-api:
+    platform: linux/amd64
     image: ghcr.io/zhongruan0522/antigravity2api-node-js:latest
     container_name: antigravity-api
     restart: unless-stopped
@@ -11,10 +12,6 @@ services:
       - PANEL_PASSWORD=设置你的密码
       - API_KEY=sk-text
       - IMAGE_BASE_URL=设置图像访问地址，如果是服务器部署有域名写域名，无域名写IP:8045，本地不写
-      # DEBUG 调试日志级别（可选，默认关闭）
-      # - low: 显示客户端完整请求与响应
-      # - high: 额外显示后端 API 请求与响应
-      # - DEBUG=high
     volumes:
       - ./data:/app/data
     healthcheck:

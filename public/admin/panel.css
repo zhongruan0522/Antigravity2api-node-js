@@ -807,6 +807,76 @@ button:disabled {
   border-color: var(--info-bg);
 }
 
+/* 模型冷却样式 */
+.cooldown-models {
+  margin-top: 12px;
+  padding: 10px;
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  border-radius: 8px;
+}
+
+[data-theme="dark"] .cooldown-models {
+  background: rgba(239, 68, 68, 0.15);
+  border-color: rgba(239, 68, 68, 0.4);
+}
+
+.cooldown-header {
+  font-size: 12px;
+  font-weight: 600;
+  color: #dc2626;
+  margin-bottom: 8px;
+}
+
+[data-theme="dark"] .cooldown-header {
+  color: #fca5a5;
+}
+
+.cooldown-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: rgba(255, 255, 255, 0.5);
+  border-radius: 6px;
+  margin-bottom: 6px;
+  font-size: 12px;
+}
+
+[data-theme="dark"] .cooldown-item {
+  background: rgba(0, 0, 0, 0.2);
+}
+
+.cooldown-item:last-child {
+  margin-bottom: 0;
+}
+
+.cooldown-icon {
+  font-size: 14px;
+}
+
+.cooldown-model {
+  flex: 1;
+  font-weight: 500;
+  color: var(--text);
+  word-break: break-all;
+}
+
+.cooldown-timer {
+  font-family: 'SF Mono', Monaco, 'Courier New', monospace;
+  font-size: 11px;
+  padding: 2px 8px;
+  background: #fef2f2;
+  color: #dc2626;
+  border-radius: 4px;
+  font-weight: 600;
+}
+
+[data-theme="dark"] .cooldown-timer {
+  background: rgba(220, 38, 38, 0.2);
+  color: #fca5a5;
+}
+
 .logs {
   display: flex;
   flex-direction: column;
@@ -1203,4 +1273,25 @@ button:disabled {
     flex-direction: column;
     gap: 8px;
   }
+}
+
+/* 额度卡片中的冷却倒计时 */
+.quota-cooldown {
+  margin-left: 8px;
+  padding: 2px 8px;
+  background: rgba(239, 68, 68, 0.2);
+  color: #f87171;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.quota-cooldown-static {
+  margin-left: 8px;
+  padding: 2px 8px;
+  background: rgba(239, 68, 68, 0.2);
+  color: #f87171;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 500;
 }

@@ -52,6 +52,8 @@ const logDetailCache = new Map();
 
 let logLevelSelect = null;
 let replaceIndex = null;
+let modelCooldownsData = []; // 模型冷却数据
+let cooldownTimerInterval = null; // 倒计时定时器
 
 if (window.AgTheme) {
   window.AgTheme.initTheme();
@@ -102,6 +104,166 @@ function formatJson(value) {
     return escapeHtml(JSON.stringify(value ?? {}, null, 2));
   } catch (e) {
     return escapeHtml(String(value));
+  }
+}
+
+// 格式化剩余时间
+function formatRemainingTime(remainingMs) {
+  if (remainingMs <= 0) return '已解禁';
+  const totalSeconds = Math.floor(remainingMs / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) {
+    return `${hours}h ${minutes}m ${seconds}s`;
+  } else if (minutes > 0) {
+    return `${minutes}m ${seconds}s`;
+  }
+  return `${seconds}s`;
+}
+
+// 获取模型冷却数据
+async function fetchModelCooldowns() {
+  try {
+    const data = await fetchJson('/auth/model-cooldowns');
+    modelCooldownsData = data.cooldowns || [];
+    return modelCooldownsData;
+  } catch (e) {
+    console.warn('获取模型冷却数据失败:', e.message);
+    return [];
+  }
+}
+
+// 获取指定账号的冷却模型
+function getCooldownsForProject(projectId) {
+  if (!projectId || !modelCooldownsData.length) return [];
+  return modelCooldownsData.filter(c => c.projectId === projectId);
+}
+
+// 模型组定义
+const MODEL_GROUPS = {
+  'Claude/GPT': ['claude-sonnet-4-5-thinking', 'claude-opus-4-5-thinking', 'claude-sonnet-4-5', 'gpt-oss-120b-medium'],
+  'Tab补全': ['chat_23310', 'chat_20706'],
+  '香蕉绘图': ['gemini-2.5-flash-image'],
+  '香蕉Pro': ['gemini-3-pro-image'],
+  'Gemini其他': ['gemini-3-pro-high', 'rev19-uic3-1p', 'gemini-2.5-flash', 'gemini-3-pro-low', 'gemini-2.5-flash-thinking', 'gemini-2.5-pro', 'gemini-2.5-flash-lite']
+};
+
+// 根据模型名获取所属组
+function getModelGroup(model) {
+  for (const [group, models] of Object.entries(MODEL_GROUPS)) {
+    if (models.includes(model)) return group;
+  }
+  return null;
+}
+
+// 渲染冷却模型列表（按组显示）
+function renderCooldownModels(projectId) {
+  const cooldowns = getCooldownsForProject(projectId);
+  if (!cooldowns.length) return '';
+
+  // 按组聚合
+  const groups = {};
+  const ungrouped = [];
+  
+  for (const c of cooldowns) {
+    const group = getModelGroup(c.model);
+    if (group) {
+      if (!groups[group]) {
+        groups[group] = { models: [], resetTimestamp: c.resetTimestamp };
+      }
+      groups[group].models.push(c.model);
+      // 取最晚的重置时间
+      if (new Date(c.resetTimestamp) > new Date(groups[group].resetTimestamp)) {
+        groups[group].resetTimestamp = c.resetTimestamp;
+      }
+    } else {
+      ungrouped.push(c);
+    }
+  }
+
+  let items = '';
+  
+  // 渲染分组
+  for (const [groupName, data] of Object.entries(groups)) {
+    const remaining = new Date(data.resetTimestamp).getTime() - Date.now();
+    items += `
+      <div class="cooldown-item" data-reset="${escapeHtml(data.resetTimestamp)}">
+        <span class="cooldown-icon">🚫</span>
+        <span class="cooldown-model">${escapeHtml(groupName)} (${data.models.length}个模型)</span>
+        <span class="cooldown-timer">${formatRemainingTime(remaining)}</span>
+      </div>
+    `;
+  }
+  
+  // 渲染未分组的
+  for (const c of ungrouped) {
+    const remaining = new Date(c.resetTimestamp).getTime() - Date.now();
+    items += `
+      <div class="cooldown-item" data-reset="${escapeHtml(c.resetTimestamp)}">
+        <span class="cooldown-icon">🚫</span>
+        <span class="cooldown-model">${escapeHtml(c.model)}</span>
+        <span class="cooldown-timer">${formatRemainingTime(remaining)}</span>
+      </div>
+    `;
+  }
+
+  return `
+    <div class="cooldown-models" data-project="${escapeHtml(projectId)}">
+      <div class="cooldown-header">⏳ 冷却中的模块</div>
+      ${items}
+    </div>
+  `;
+}
+
+// 更新所有倒计时显示
+function updateCooldownTimers() {
+  const now = Date.now();
+  document.querySelectorAll('.cooldown-item').forEach(item => {
+    const resetTime = new Date(item.dataset.reset).getTime();
+    const remaining = resetTime - now;
+    const timerEl = item.querySelector('.cooldown-timer');
+    if (timerEl) {
+      if (remaining <= 0) {
+        item.remove();
+      } else {
+        timerEl.textContent = formatRemainingTime(remaining);
+      }
+    }
+  });
+
+  // 更新额度卡片中的冷却倒计时
+  document.querySelectorAll('.quota-cooldown').forEach(el => {
+    const resetTime = new Date(el.dataset.reset).getTime();
+    const remaining = resetTime - now;
+    if (remaining <= 0) {
+      el.remove();
+    } else {
+      el.textContent = `🚫 ${formatRemainingTime(remaining)}`;
+    }
+  });
+
+  // 清理空的冷却容器
+  document.querySelectorAll('.cooldown-models').forEach(container => {
+    if (!container.querySelector('.cooldown-item')) {
+      container.remove();
+    }
+  });
+}
+
+// 启动倒计时定时器
+function startCooldownTimer() {
+  if (cooldownTimerInterval) {
+    clearInterval(cooldownTimerInterval);
+  }
+  cooldownTimerInterval = setInterval(updateCooldownTimers, 1000);
+}
+
+// 停止倒计时定时器
+function stopCooldownTimer() {
+  if (cooldownTimerInterval) {
+    clearInterval(cooldownTimerInterval);
+    cooldownTimerInterval = null;
   }
 }
 
@@ -267,6 +429,7 @@ function bindAccountActions() {
   document.querySelectorAll('[data-action="toggleQuota"]')?.forEach(btn => {
     btn.addEventListener('click', async () => {
       const idx = btn.dataset.index;
+      const projectId = btn.dataset.project;
       if (idx === undefined) return;
 
       const quotaSection = document.getElementById(`quota-${idx}`);
@@ -274,12 +437,12 @@ function bindAccountActions() {
 
       quotaSection.style.display = 'block';
       btn.textContent = '📊 刷新额度';
-      await loadQuota(idx, true);
+      await loadQuota(idx, true, projectId);
     });
   });
 }
 
-async function loadQuota(accountIndex, showLoading = false) {
+async function loadQuota(accountIndex, showLoading = false, projectId = null) {
   const quotaSection = document.getElementById(`quota-${accountIndex}`);
   if (!quotaSection) return;
 
@@ -288,13 +451,13 @@ async function loadQuota(accountIndex, showLoading = false) {
       quotaSection.innerHTML = '<div class="quota-loading">加载中...</div>';
     }
     const data = await fetchJson(`/admin/tokens/${accountIndex}/quotas`, { cache: 'no-store' });
-    renderQuota(quotaSection, data.data);
+    renderQuota(quotaSection, data.data, projectId);
   } catch (e) {
     quotaSection.innerHTML = `<div class="quota-error">加载失败: ${e.message}</div>`;
   }
 }
 
-function renderQuota(container, quotaData) {
+function renderQuota(container, quotaData, projectId = null) {
   if (!quotaData || !quotaData.models) {
     container.innerHTML = '<div class="quota-error">暂无额度数据</div>';
     return;
@@ -401,12 +564,46 @@ function renderQuota(container, quotaData) {
     const colorClass = remainingPercentage > 50 ? 'quota-high' :
                       remainingPercentage > 20 ? 'quota-medium' : 'quota-low';
 
+    // 检查该模型组是否在冷却中，或者额度为0
+    let cooldownHtml = '';
+    if (projectId) {
+      const cooldowns = getCooldownsForProject(projectId);
+      const groupModels = groupData.modelIds;
+      const cooldown = cooldowns.find(c => groupModels.includes(c.model));
+      
+      if (cooldown) {
+        // 有冷却记录，用冷却记录的时间
+        const remaining = new Date(cooldown.resetTimestamp).getTime() - Date.now();
+        if (remaining > 0) {
+          cooldownHtml = `<span class="quota-cooldown" data-reset="${escapeHtml(cooldown.resetTimestamp)}">🚫 ${formatRemainingTime(remaining)}</span>`;
+        }
+      } else if (remainingPercentage === 0 && resetTime && resetTime !== '未知时间') {
+        // 额度为0但没在冷却列表中，用 API 返回的重置时间计算倒计时
+        // resetTime 格式如 "12-29 01:25"，需要转换为完整日期
+        const now = new Date();
+        const [monthDay, time] = resetTime.split(' ');
+        const [month, day] = monthDay.split('-').map(Number);
+        const [hour, minute] = time.split(':').map(Number);
+        const resetDate = new Date(now.getFullYear(), month - 1, day, hour, minute);
+        // 如果重置时间已过，可能是明年
+        if (resetDate < now) resetDate.setFullYear(now.getFullYear() + 1);
+        const remaining = resetDate.getTime() - now.getTime();
+        if (remaining > 0) {
+          cooldownHtml = `<span class="quota-cooldown" data-reset="${resetDate.toISOString()}">🚫 ${formatRemainingTime(remaining)}</span>`;
+        } else {
+          cooldownHtml = `<span class="quota-cooldown-static">🚫 已耗尽</span>`;
+        }
+      } else if (remainingPercentage === 0) {
+        cooldownHtml = `<span class="quota-cooldown-static">🚫 已耗尽</span>`;
+      }
+    }
+
     html += `
       <div class="quota-group-item">
         <div class="quota-group-header">
           <span class="quota-group-icon">${groupData.icon}</span>
           <div class="quota-group-info">
-            <div class="quota-group-name">${escapeHtml(groupName)}</div>
+            <div class="quota-group-name">${escapeHtml(groupName)}${cooldownHtml}</div>
             <div class="quota-group-models" data-collapsible="true">(${groupData.modelIds.map(id => escapeHtml(id)).join(', ')})</div>
             <div class="quota-group-description">${escapeHtml(groupData.description)}</div>
           </div>
@@ -488,10 +685,15 @@ function renderQuota(container, quotaData) {
 
 async function refreshAccounts() {
   try {
-    const data = await fetchJson('/auth/accounts');
-    accountsData = data.accounts || [];
+    // 同时获取账号和冷却数据
+    const [accountData] = await Promise.all([
+      fetchJson('/auth/accounts'),
+      fetchModelCooldowns()
+    ]);
+    accountsData = accountData.accounts || [];
     updateFilteredAccounts();
     loadHourlyUsage();
+    startCooldownTimer(); // 启动倒计时
   } catch (e) {
     listEl.textContent = '加载失败: ' + e.message;
   }
@@ -551,7 +753,7 @@ function renderAccountsList() {
               </div>
               <div class="action-row secondary">
                 <button class="mini-btn" data-action="refreshProjectId" data-index="${acc.index}">🔄 刷新项目ID</button>
-                <button class="mini-btn" data-action="toggleQuota" data-index="${acc.index}">📊 查看额度</button>
+                <button class="mini-btn" data-action="toggleQuota" data-index="${acc.index}" data-project="${acc.projectId || ''}">📊 查看额度</button>
               </div>
             </div>
             <div class="quota-section" id="quota-${acc.index}" style="display: none;">
