@@ -22,6 +22,10 @@ const importTomlBtn = document.getElementById('importTomlBtn');
 const tomlInput = document.getElementById('tomlInput');
 const replaceExistingCheckbox = document.getElementById('replaceExisting');
 const filterDisabledCheckbox = document.getElementById('filterDisabled');
+const importRefreshTokensBtn = document.getElementById('importRefreshTokensBtn');
+const refreshTokensInput = document.getElementById('refreshTokensInput');
+const refreshTokensStatusEl = document.getElementById('refreshTokensStatus');
+const replaceExistingRefreshTokensCheckbox = document.getElementById('replaceExistingRefreshTokens');
 const tabButtons = document.querySelectorAll('.tab-btn');
 const tabPanels = document.querySelectorAll('.tab-panel');
 const deleteDisabledBtn = document.getElementById('deleteDisabledBtn');
@@ -87,6 +91,37 @@ async function fetchJson(url, options = {}) {
     throw new Error(data.error || `HTTP ${res.status}`);
   }
   return data;
+}
+
+function extractRefreshTokens(text) {
+  if (!text) return [];
+  const input = String(text).trim();
+  if (!input) return [];
+
+  let tokens = [];
+
+  try {
+    if (input.startsWith('[') && input.endsWith(']')) {
+      const parsed = JSON.parse(input);
+      if (Array.isArray(parsed)) {
+        tokens = parsed
+          .map(item => {
+            if (typeof item === 'string') return item;
+            if (item && typeof item === 'object') return item.refresh_token ?? item.refreshToken ?? null;
+            return null;
+          })
+          .filter(token => typeof token === 'string' && token.startsWith('1//'));
+      }
+    }
+  } catch (e) {
+  }
+
+  if (tokens.length === 0) {
+    const matches = input.match(/1\/\/[a-zA-Z0-9_\-]+/g);
+    if (matches) tokens = matches;
+  }
+
+  return [...new Set(tokens)];
 }
 
 function escapeHtml(str) {
@@ -1400,6 +1435,44 @@ if (importTomlBtn && tomlInput) {
       setStatus('导入失败: ' + e.message, 'error', tomlStatusEl);
     } finally {
       importTomlBtn.disabled = false;
+    }
+  });
+}
+
+if (importRefreshTokensBtn && refreshTokensInput) {
+  importRefreshTokensBtn.addEventListener('click', async () => {
+    const content = refreshTokensInput.value.trim();
+    if (!content) {
+      setStatus('请粘贴 Refresh Token 后再导入。', 'error', refreshTokensStatusEl);
+      return;
+    }
+
+    const tokens = extractRefreshTokens(content);
+    if (!tokens.length) {
+      setStatus('未在输入中识别到有效的 Refresh Token（应以 1// 开头）。', 'error', refreshTokensStatusEl);
+      return;
+    }
+
+    const replaceExisting = !!replaceExistingRefreshTokensCheckbox?.checked;
+
+    try {
+      importRefreshTokensBtn.disabled = true;
+      setStatus('正在导入 Refresh Token...', 'info', refreshTokensStatusEl);
+      const result = await fetchJson('/auth/accounts/import-refresh-tokens', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tokens, replaceExisting })
+      });
+
+      const summary = `导入成功：有效 ${result.imported ?? 0} 条，跳过 ${result.skipped ?? 0} 条，总计 ${result.total ?? 0} 个账号。`;
+      setStatus(summary, 'success', refreshTokensStatusEl);
+      refreshTokensInput.value = '';
+      refreshAccounts();
+      loadLogs();
+    } catch (e) {
+      setStatus('导入失败: ' + e.message, 'error', refreshTokensStatusEl);
+    } finally {
+      importRefreshTokensBtn.disabled = false;
     }
   });
 }

@@ -16,13 +16,12 @@ import { generateRequestBody, generateRequestBodyFromGemini } from '../utils/uti
 import { saveBase64Image } from '../utils/imageStorage.js';
 import { generateProjectId } from '../utils/idGenerator.js';
 import {
-  mapClaudeToOpenAI,
-  mapClaudeToolsToOpenAITools,
+  convertClaudeToGeminiRequest,
   countClaudeTokens,
   ClaudeSseEmitter,
   buildClaudeContentBlocks,
   estimateTokensFromText
-} from '../utils/claudeAdapter.js';
+} from '../utils/claudeToGemini.js';
 import logger from '../utils/logger.js';
 import {
   loadDataConfig,
@@ -43,6 +42,7 @@ import {
   clearLogs
 } from '../utils/log_store.js';
 import quotaManager from '../auth/quota_manager.js';
+import QuotaMonitor from '../auth/quota_monitor.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -694,6 +694,44 @@ function normalizeTomlAccount(raw, { filterDisabled = false } = {}) {
   return normalized;
 }
 
+function extractRefreshTokensFromText(text) {
+  if (!text || typeof text !== 'string') return [];
+  const input = text.trim();
+  if (!input) return [];
+
+  let tokens = [];
+
+  try {
+    if (input.startsWith('[') && input.endsWith(']')) {
+      const parsed = JSON.parse(input);
+      if (Array.isArray(parsed)) {
+        tokens = parsed
+          .map(item => {
+            if (typeof item === 'string') return item;
+            if (item && typeof item === 'object') return item.refresh_token ?? item.refreshToken ?? null;
+            return null;
+          })
+          .filter(token => typeof token === 'string' && token.startsWith('1//'));
+      }
+    }
+  } catch {
+  }
+
+  if (tokens.length === 0) {
+    const matches = input.match(/1\/\/[a-zA-Z0-9_\-]+/g);
+    if (matches) tokens = matches;
+  }
+
+  return Array.from(new Set(tokens));
+}
+
+function normalizeRefreshTokenAccount(refreshToken) {
+  if (!refreshToken || typeof refreshToken !== 'string') return null;
+  const token = refreshToken.trim();
+  if (!/^1\/\/[a-zA-Z0-9_\-]+$/.test(token)) return null;
+  return { refresh_token: token, enable: true };
+}
+
 function mergeAccounts(existing, incoming, replaceExisting = false) {
   if (replaceExisting) return incoming;
 
@@ -1011,6 +1049,74 @@ app.post('/auth/accounts/import-toml', requirePanelAuthApi, (req, res) => {
 
   if (normalized.length === 0) {
     return res.status(400).json({ error: 'TOML 中没有有效的账号信息' });
+  }
+
+  let existing = [];
+  if (!replaceExisting && fs.existsSync(ACCOUNTS_FILE)) {
+    try {
+      existing = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf-8'));
+      if (!Array.isArray(existing)) existing = [];
+    } catch (e) {
+      logger.warn(`读取 accounts.json 失败，将忽略已有账号: ${e.message}`);
+      existing = [];
+    }
+  }
+
+  const merged = mergeAccounts(existing, normalized, replaceExisting);
+
+  const dir = path.dirname(ACCOUNTS_FILE);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+
+  fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(merged, null, 2), 'utf-8');
+
+  if (typeof tokenManager.initialize === 'function') {
+    tokenManager.initialize();
+  }
+
+  return res.json({
+    success: true,
+    imported: normalized.length,
+    skipped,
+    total: merged.length
+  });
+});
+
+// Import refresh_token(s) and merge into accounts.json
+app.post('/auth/accounts/import-refresh-tokens', requirePanelAuthApi, (req, res) => {
+  const { tokens, content, replaceExisting = false } = req.body || {};
+
+  const rawTokens = Array.isArray(tokens)
+    ? tokens
+    : typeof content === 'string'
+      ? extractRefreshTokensFromText(content)
+      : null;
+
+  if (!rawTokens) {
+    return res.status(400).json({ error: 'tokens（数组）或 content（字符串）至少提供一个' });
+  }
+
+  const normalized = [];
+  let skipped = 0;
+  const seen = new Set();
+
+  for (const raw of rawTokens) {
+    const acc = normalizeRefreshTokenAccount(raw);
+    if (!acc) {
+      skipped += 1;
+      continue;
+    }
+    if (seen.has(acc.refresh_token)) {
+      skipped += 1;
+      continue;
+    }
+    seen.add(acc.refresh_token);
+    normalized.push(acc);
+  }
+
+  if (normalized.length === 0) {
+    return res.status(400).json({ error: '未在输入中识别到有效的 Refresh Token（应以 1// 开头）' });
   }
 
   let existing = [];
@@ -1566,7 +1672,12 @@ app.use('/admin', (req, res, next) => {
 // ===== API routes =====
 
 const createChatCompletionHandler = (resolveToken, options = {}) => async (req, res) => {
-  const { messages, model, stream = true, tools, ...params } = req.body || {};
+  const { messages, model, tools, ...params } = req.body || {};
+  // 修复：明确处理 stream 参数，避免类型转换问题
+  // 默认流式，但如果明确传入 false/0/"false"/"0" 则使用非流式
+  const stream = req.body?.stream === false || req.body?.stream === 0 || req.body?.stream === "false" || req.body?.stream === "0"
+    ? false
+    : (req.body?.stream === undefined || req.body?.stream === null ? true : Boolean(req.body?.stream));
   const startedAt = Date.now();
   const requestSnapshot = createRequestSnapshot(req);
   const streamEventsForLog = [];
@@ -1622,6 +1733,25 @@ const createChatCompletionHandler = (resolveToken, options = {}) => async (req, 
 
     token = await resolveToken(req);
     if (!token) {
+      const upstreamModelForError = (() => {
+        if (typeof model !== 'string') return null;
+        const match = model.match(/^(.*-image)(?:-(1k|2k|4k))$/i);
+        return match ? match[1] : model;
+      })();
+
+      if (
+        upstreamModelForError &&
+        options.tokenMissingStatus === undefined &&
+        Array.isArray(tokenManager.tokens) &&
+        tokenManager.tokens.length > 0 &&
+        tokenManager.tokens.every(t => tokenManager.isModelDisabled(t, upstreamModelForError))
+      ) {
+        const message = `模型 ${upstreamModelForError} 的额度已不足，当前所有凭证都无法使用该模型`;
+        const status = 429; // Too Many Requests
+        res.status(status).json({ error: message });
+        writeLog({ success: false, status, message });
+        return;
+      }
       const message =
         options.tokenMissingError || '没有可用的 token，请先通过 OAuth 面板或 npm run login 获取。';
       const status = options.tokenMissingStatus || 503;
@@ -1642,6 +1772,15 @@ const createChatCompletionHandler = (resolveToken, options = {}) => async (req, 
     }
 
     // 将分辨率写入参数（仅当用户未显式传入时）
+    // 检查该 token 的模型是否被禁用（以最终上游模型为准，避免后缀绕过）
+    if (upstreamModel && tokenManager.isModelDisabled(token, upstreamModel)) {
+      const message = `模型 ${upstreamModel} 的额度已不足，该凭证暂时无法使用此模型`;
+      const status = 429; // Too Many Requests
+      res.status(status).json({ error: message });
+      writeLog({ success: false, status, message });
+      return;
+    }
+
     const paramsWithImageSize = { ...params };
     const userHasImageSize =
       params.image_size ||
@@ -1972,8 +2111,22 @@ const handleGeminiGenerateContent = async (req, res) => {
       return;
     }
 
-    token = await tokenManager.getToken();
+    token = await tokenManager.getToken(upstreamModel);
     if (!token) {
+      const allModelDisabled =
+        upstreamModel &&
+        Array.isArray(tokenManager.tokens) &&
+        tokenManager.tokens.length > 0 &&
+        tokenManager.tokens.every(t => tokenManager.isModelDisabled(t, upstreamModel));
+
+      if (allModelDisabled) {
+        const status = 429;
+        const message = `模型 ${upstreamModel} 的额度已不足，当前所有凭证都无法使用该模型`;
+        res.status(status).json({ error: message });
+        writeLog({ success: false, status, message });
+        return;
+      }
+
       const status = 503;
       const message = '没有可用的 token，请先通过 OAuth 面板或 npm run login 获取。';
       res.status(status).json({ error: message });
@@ -1982,6 +2135,14 @@ const handleGeminiGenerateContent = async (req, res) => {
     }
 
     // 将 Gemini 原生请求包装成 Antigravity 请求体
+    if (upstreamModel && tokenManager.isModelDisabled(token, upstreamModel)) {
+      const message = `模型 ${upstreamModel} 的额度已不足，该凭证暂时无法使用此模型`;
+      const status = 429; // Too Many Requests
+      res.status(status).json({ error: message });
+      writeLog({ success: false, status, message });
+      return;
+    }
+
     const requestBody = generateRequestBodyFromGemini(body, upstreamModel, token);
 
     // 当前只支持非流式：即官方 Gemini 的 :generateContent 语义
@@ -2078,10 +2239,32 @@ const handleGeminiStreamGenerateContent = async (req, res) => {
       }
     }
 
-    token = await tokenManager.getToken();
+    token = await tokenManager.getToken(upstreamModel);
     if (!token) {
+      const allModelDisabled =
+        upstreamModel &&
+        Array.isArray(tokenManager.tokens) &&
+        tokenManager.tokens.length > 0 &&
+        tokenManager.tokens.every(t => tokenManager.isModelDisabled(t, upstreamModel));
+
+      if (allModelDisabled) {
+        const status = 429;
+        const message = `模型 ${upstreamModel} 的额度已不足，当前所有凭证都无法使用该模型`;
+        res.status(status).json({ error: message });
+        writeLog({ success: false, status, message });
+        return;
+      }
+
       const status = 503;
       const message = '没有可用的 token，请先通过 OAuth 面板或 npm run login 获取。';
+      res.status(status).json({ error: message });
+      writeLog({ success: false, status, message });
+      return;
+    }
+
+    if (upstreamModel && tokenManager.isModelDisabled(token, upstreamModel)) {
+      const message = `模型 ${upstreamModel} 的额度已不足，该凭证暂时无法使用此模型`;
+      const status = 429; // Too Many Requests
       res.status(status).json({ error: message });
       writeLog({ success: false, status, message });
       return;
@@ -2145,9 +2328,6 @@ const handleGeminiStreamGenerateContent = async (req, res) => {
 
 app.post('/v1beta/models/:model\\:generateContent', handleGeminiGenerateContent);
 app.post('/v1beta/models/:model\\:streamGenerateContent', handleGeminiStreamGenerateContent);
-// 兼容 README 中的 /gemini/v1beta 前缀
-app.post('/gemini/v1beta/models/:model\\:generateContent', handleGeminiGenerateContent);
-app.post('/gemini/v1beta/models/:model\\:streamGenerateContent', handleGeminiStreamGenerateContent);
 
 // OpenAI 图像生成兼容接口：/v1/images/generations
 app.post('/v1/images/generations', async (req, res) => {
@@ -2216,10 +2396,32 @@ app.post('/v1/images/generations', async (req, res) => {
     const params = {};
     if (imageSize) params.image_size = imageSize;
 
-    token = await tokenManager.getToken();
+    token = await tokenManager.getToken(model);
     if (!token) {
+      const allModelDisabled =
+        model &&
+        Array.isArray(tokenManager.tokens) &&
+        tokenManager.tokens.length > 0 &&
+        tokenManager.tokens.every(t => tokenManager.isModelDisabled(t, model));
+
+      if (allModelDisabled) {
+        const status = 429;
+        const message = `模型 ${model} 的额度已不足，当前所有凭证都无法使用该模型`;
+        res.status(status).json({ error: message });
+        writeLog({ success: false, status, message });
+        return;
+      }
+
       const status = 503;
       const message = '没有可用的 token，请先通过 OAuth 面板或 npm run login 获取。';
+      res.status(status).json({ error: message });
+      writeLog({ success: false, status, message });
+      return;
+    }
+
+    if (model && tokenManager.isModelDisabled(token, model)) {
+      const message = `模型 ${model} 的额度已不足，该凭证暂时无法使用此模型`;
+      const status = 429; // Too Many Requests
       res.status(status).json({ error: message });
       writeLog({ success: false, status, message });
       return;
@@ -2270,7 +2472,18 @@ app.post('/v1/images/generations', async (req, res) => {
   }
 });
 
-app.post('/v1/chat/completions', createChatCompletionHandler(() => tokenManager.getToken()));
+app.post(
+  '/v1/chat/completions',
+  createChatCompletionHandler(req => {
+    const rawModel = req.body?.model;
+    let upstreamModel = rawModel;
+    if (typeof rawModel === 'string') {
+      const match = rawModel.match(/^(.*-image)(?:-(1k|2k|4k))$/i);
+      if (match) upstreamModel = match[1];
+    }
+    return tokenManager.getToken(upstreamModel);
+  })
+);
 app.post(
   '/:credential/v1/chat/completions',
   createChatCompletionHandler(
@@ -2340,14 +2553,13 @@ app.post('/v1/messages', async (req, res) => {
   const requestSnapshot = createRequestSnapshot(req);
   let responseBodyForLog = null;
   let token = null;
-  let openaiReq = null;
   let requestBody = null;
   let clientModelForLog = null;
 
   const writeLog = ({ success, status, message }) => {
     appendLog({
       timestamp: new Date().toISOString(),
-      model: clientModelForLog || openaiReq?.model || req.body?.model || 'unknown',
+      model: clientModelForLog || req.body?.model || 'unknown',
       projectId: token?.projectId || null,
       success,
       status,
@@ -2383,37 +2595,9 @@ app.post('/v1/messages', async (req, res) => {
   };
 
   try {
-    openaiReq = mapClaudeToOpenAI(req.body || {});
-    clientModelForLog = openaiReq.model;
+    // 直接使用 Claude → Gemini 转换，跳过 OpenAI 中间层
+    clientModelForLog = req.body?.model || 'unknown';
 
-    // 兼容模型别名后缀 -1k/-2k/-4k：用于指定分辨率，发送给上游时去掉后缀
-    let upstreamModel = openaiReq.model;
-    let imageSizeFromModel = null;
-    if (typeof upstreamModel === 'string') {
-      const match = upstreamModel.match(/^(.*-image)(?:-(1k|2k|4k))$/i);
-      if (match) {
-        upstreamModel = match[1];
-        imageSizeFromModel = match[2].toUpperCase(); // 1K/2K/4K
-      }
-    }
-    // 若通过模型后缀指定分辨率且请求未显式携带，则补充 image_size 参数
-    if (imageSizeFromModel) {
-      const hasImageSize =
-        openaiReq.image_size ||
-        openaiReq.imageSize ||
-        openaiReq?.generation_config?.image_size ||
-        openaiReq?.generation_config?.imageSize ||
-        openaiReq?.generation_config?.image_config?.image_size ||
-        openaiReq?.generation_config?.image_config?.imageSize ||
-        openaiReq?.generationConfig?.image_size ||
-        openaiReq?.generationConfig?.imageSize ||
-        openaiReq?.generationConfig?.image_config?.image_size ||
-        openaiReq?.generationConfig?.image_config?.imageSize;
-      if (!hasImageSize) {
-        openaiReq.image_size = imageSizeFromModel;
-      }
-    }
-    openaiReq.model = upstreamModel;
     const tokenStats = (() => {
       try {
         return countClaudeTokens(req.body || {});
@@ -2422,29 +2606,61 @@ app.post('/v1/messages', async (req, res) => {
       }
     })();
 
-    token = await tokenManager.getToken();
+    token = await tokenManager.getToken(req.body?.model);
     if (!token) {
+      const requestedModel = req.body?.model;
+      const allModelDisabled =
+        typeof requestedModel === 'string' &&
+        Array.isArray(tokenManager.tokens) &&
+        tokenManager.tokens.length > 0 &&
+        tokenManager.tokens.every(t => tokenManager.isModelDisabled(t, requestedModel));
+
+      if (allModelDisabled) {
+        const status = 429;
+        const message = `模型 ${requestedModel} 的额度已不足，当前所有凭证都无法使用该模型`;
+        res.status(status).json({ error: message });
+        writeLog({ success: false, status, message });
+        return;
+      }
+
       const message = '娌℃湁鍙敤鐨?token锛岃鍏堥€氳繃 OAuth 闈㈡澘鎴?npm run login 鑾峰彇銆?';
       res.status(503).json({ error: message });
       writeLog({ success: false, status: 503, message });
       return;
     }
 
-    const openaiTools = mapClaudeToolsToOpenAITools(req.body?.tools || []);
-    requestBody = generateRequestBody(
-      openaiReq.messages,
-      openaiReq.model,
-      openaiReq,
-      openaiTools,
-      token
-    );
+    // 直接将 Claude 请求转换为 Gemini/VER 格式
+    requestBody = convertClaudeToGeminiRequest(req.body || {}, token);
+
+    if (requestBody?.model && tokenManager.isModelDisabled(token, requestBody.model)) {
+      const message = `模型 ${requestBody.model} 的额度已不足，该凭证暂时无法使用此模型`;
+      const status = 429; // Too Many Requests
+      res.status(status).json({ error: message });
+      writeLog({ success: false, status, message });
+      return;
+    }
 
     const requestId = requestBody.requestId;
+    // 修复：明确处理 stream 参数，避免类型转换问题
+    // 默认流式，但如果明确传入 false/0/"false"/"0" 则使用非流式
+    const accept = String(req.headers?.accept || '');
+    const wantsSse = accept.includes('text/event-stream');
+    const streamValue = req.body?.stream;
 
-    if (openaiReq.stream) {
+    const isStreaming =
+      streamValue === true || streamValue === 1 || streamValue === 'true' || streamValue === '1'
+        ? true
+        : streamValue === false ||
+            streamValue === 0 ||
+            streamValue === 'false' ||
+            streamValue === '0'
+          ? false
+          : wantsSse;
+
+    if (isStreaming) {
       setStreamHeaders(res);
       const emitter = new ClaudeSseEmitter(res, requestId, {
-        model: openaiReq.model,
+        model: clientModelForLog,
         inputTokens: tokenStats?.input_tokens || 0
       });
       emitter.start();
@@ -2466,17 +2682,26 @@ app.post('/v1/messages', async (req, res) => {
       writeLog({ success: true, status: res.statusCode || 200 });
     } else {
       const result = await generateAssistantResponseNoStream(requestBody, token);
-      const contentBlocks = buildClaudeContentBlocks(result.content, result.toolCalls);
+      const contentText =
+        typeof result.content === 'string'
+          ? result.content
+              .replace(/<think>[\s\S]*?<\/think>\s*/g, '')
+              .replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '')
+          : result.content;
+      const contentBlocks = buildClaudeContentBlocks(contentText, result.toolCalls, result.thinking);
+      const fallbackOutputTokens =
+        (contentText ? estimateTokensFromText(contentText) : 0) +
+        (result.thinking ? estimateTokensFromText(result.thinking) : 0);
       const outputTokens =
         result.usage?.completion_tokens ??
         result.usage?.output_tokens ??
-        (result.content ? estimateTokensFromText(result.content) : 0);
+        fallbackOutputTokens;
 
       const payload = {
         id: `msg_${requestId}`,
         type: 'message',
         role: 'assistant',
-        model: openaiReq.model,
+        model: clientModelForLog,
         content: contentBlocks,
         stop_reason: result.toolCalls?.length ? 'tool_use' : 'end_turn',
         stop_sequence: null,
@@ -2504,6 +2729,15 @@ app.post('/v1/messages', async (req, res) => {
 
 const server = app.listen(config.server.port, config.server.host, () => {
   logger.info(`服务已启动: ${config.server.host}:${config.server.port}`);
+
+  // 初始化额度监控器
+  const quotaMonitor = new QuotaMonitor(tokenManager, ACCOUNTS_FILE);
+  tokenManager.setQuotaMonitor(quotaMonitor);
+  quotaMonitor.start();
+  logger.info('QuotaMonitor 已启动，将每 30 分钟检查凭证额度');
+
+  // 保存 quotaMonitor 实例到 server 对象，以便关闭时使用
+  server.quotaMonitor = quotaMonitor;
 });
 
 server.on('error', error => {
@@ -2521,6 +2755,12 @@ server.on('error', error => {
 
 const shutdown = () => {
   logger.info('正在关闭服务...');
+
+  // 停止额度监控器
+  if (server.quotaMonitor) {
+    server.quotaMonitor.stop();
+  }
+
   closeRequester();
   server.close(() => {
     logger.info('服务已关闭');

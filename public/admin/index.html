@@ -94,6 +94,28 @@
       </div>
     </section>
 
+    <section class="card tab-panel" data-tab="import">
+      <div class="card-header">
+        <div>
+          <div class="eyebrow">步骤 1.6</div>
+          <h2>批量导入 Refresh Token</h2>
+          <p>只需要 <code>refresh_token</code>，支持多种格式自动识别。</p>
+        </div>
+        <button id="importRefreshTokensBtn">📥 导入 RefreshToken</button>
+      </div>
+      <div class="card-body">
+        <p>把 refresh_token 粘贴到下方即可（支持 JSON 数组 / 任意文本自动提取）。</p>
+        <textarea id="refreshTokensInput" class="textarea" rows="8" placeholder="在此处粘贴您的 Refresh Token（支持批量）&#10;&#10;支持格式:&#10;1. 单个 Token (1//...)&#10;2. JSON 数组（含 refresh_token 字段）&#10;3. 任意包含 Token 的文本（自动提取）"></textarea>
+        <label class="checkbox-row">
+          <input type="checkbox" id="replaceExistingRefreshTokens" />
+          <span>覆盖已存在的账号（勾选后将只保留本次导入的账号）</span>
+        </label>
+        <div class="inline-row">
+          <span id="refreshTokensStatus" class="badge" style="display:none;"></span>
+        </div>
+      </div>
+    </section>
+
     <section class="card tab-panel" data-tab="manage">
       <div class="card-header">
         <div>

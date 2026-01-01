@@ -13,6 +13,20 @@ const __dirname = path.dirname(__filename);
 const CLIENT_ID = '1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com';
 const CLIENT_SECRET = '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';
 
+function getTokenSuffix(token) {
+  const accessToken = token?.access_token;
+  if (typeof accessToken === 'string' && accessToken.length) {
+    return accessToken.slice(-8);
+  }
+
+  const refreshToken = token?.refresh_token;
+  if (typeof refreshToken === 'string' && refreshToken.length) {
+    return refreshToken.slice(-8);
+  }
+
+  return 'unknown';
+}
+
 class TokenManager {
   constructor(filePath = path.join(__dirname,'..','..','data' ,'accounts.json')) {
     this.filePath = filePath;
@@ -21,6 +35,7 @@ class TokenManager {
     this.hourlyLimit = Number.isFinite(Number(config.credentials?.maxUsagePerHour))
       ? Number(config.credentials.maxUsagePerHour)
       : 20;
+    this.quotaMonitor = null; // 额度监控器实例（将在 server 初始化时注入）
     this.initialize();
   }
 
@@ -39,6 +54,26 @@ class TokenManager {
   setHourlyLimit(limit) {
     if (!Number.isFinite(Number(limit))) return;
     this.hourlyLimit = Number(limit);
+  }
+
+  /**
+   * 注入额度监控器实例
+   */
+  setQuotaMonitor(monitor) {
+    this.quotaMonitor = monitor;
+    log.info('QuotaMonitor 已注入到 TokenManager');
+  }
+
+  /**
+   * 检查 token 的某个模型是否被禁用
+   * @param {Object} token - token 对象
+   * @param {string} modelName - 模型名称（如 "gemini-2.0-flash-exp"）
+   * @returns {boolean} - 是否被禁用
+   */
+  isModelDisabled(token, modelName) {
+    if (!token || !modelName) return false;
+    const disabledModels = token.disabledModels || [];
+    return disabledModels.includes(modelName);
   }
 
   isWithinHourlyLimit(token) {
@@ -76,7 +111,8 @@ class TokenManager {
 
       this.tokens = tokenArray.filter(token => token.enable !== false).map(token => ({
         ...token,
-        sessionId: generateSessionId()
+        sessionId: generateSessionId(),
+        disabledModels: token.disabledModels || [] // 初始化禁用模型列表
       }));
       this.currentIndex = 0;
       log.info(`成功加载 ${this.tokens.length} 个可用token`);
@@ -171,23 +207,32 @@ class TokenManager {
   }
 
   disableToken(token) {
-    log.warn(`禁用token ...${token.access_token.slice(-8)}`)
+    log.warn(`禁用token ...${getTokenSuffix(token)}`)
     token.enable = false;
     this.saveToFile();
     this.tokens = this.tokens.filter(t => t.refresh_token !== token.refresh_token);
     this.currentIndex = this.currentIndex % Math.max(this.tokens.length, 1);
   }
 
-  async getToken() {
+  async getToken(modelName = null) {
     if (this.tokens.length === 0) return null;
 
     let attempts = 0;
     const totalTokens = this.tokens.length;
+    const effectiveModelName =
+      typeof modelName === 'string' && modelName.trim() ? modelName.trim() : null;
 
     while (attempts < totalTokens) {
       const token = this.tokens[this.currentIndex];
 
       try {
+        // 如果当前请求指定了模型，且该凭证对该模型已被禁用，则直接尝试下一个凭证
+        if (effectiveModelName && this.isModelDisabled(token, effectiveModelName)) {
+          this.moveToNextToken();
+          attempts += 1;
+          continue;
+        }
+
         if (this.isExpired(token)) {
           await this.refreshToken(token);
         }
@@ -196,12 +241,12 @@ class TokenManager {
           if (config.skipProjectIdFetch) {
             token.projectId = generateProjectId();
             this.saveToFile();
-            log.info(`...${token.access_token.slice(-8)}: 使用随机生成的projectId: ${token.projectId}`);
+            log.info(`...${getTokenSuffix(token)}: 使用随机生成的projectId: ${token.projectId}`);
           } else {
             try {
               const projectId = await this.fetchProjectId(token);
               if (projectId === undefined) {
-                log.warn(`...${token.access_token.slice(-8)}: 无资格获取projectId，跳过保存`);
+                log.warn(`...${getTokenSuffix(token)}: 无资格获取projectId，跳过保存`);
                 this.disableToken(token);
                 if (this.tokens.length === 0) return null;
                 attempts += 1;
@@ -210,7 +255,7 @@ class TokenManager {
               token.projectId = projectId;
               this.saveToFile();
             } catch (error) {
-              log.error(`...${token.access_token.slice(-8)}: 获取projectId失败:`, error.message);
+              log.error(`...${getTokenSuffix(token)}: 获取projectId失败:`, error.message);
               this.moveToNextToken();
               attempts += 1;
               continue;
@@ -222,6 +267,11 @@ class TokenManager {
           this.moveToNextToken();
           attempts += 1;
           continue;
+        }
+
+        // 通知 quotaMonitor 该凭证被使用
+        if (this.quotaMonitor && token.projectId) {
+          this.quotaMonitor.markTokenUsed(token.projectId);
         }
 
         return token;
@@ -252,6 +302,11 @@ class TokenManager {
     try {
       if (this.isExpired(token)) {
         await this.refreshToken(token);
+      }
+
+      // 通知 quotaMonitor 该凭证被使用
+      if (this.quotaMonitor && token.projectId) {
+        this.quotaMonitor.markTokenUsed(token.projectId);
       }
       return token;
     } catch (error) {

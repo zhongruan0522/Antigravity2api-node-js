@@ -309,6 +309,7 @@ class ModelCooldownManager {
       if (token.enable === false) continue;
       if (excludeSet.has(token.projectId)) continue;
       if (this.isOnCooldown(token.projectId, model)) continue;
+      if (tokenManager.isModelDisabled && tokenManager.isModelDisabled(token, model)) continue;
 
       // Check if token is valid and refresh if needed
       try {

@@ -388,7 +388,7 @@ async function withRetry(operationFactory, initialToken, requestModel = null) {
             if (is429 && tokenAttempts >= maxAttemptsPerToken) {
                 log.info(`[withRetry] 429错误，当前token已重试${tokenAttempts}次，尝试切换到下一个token...`);
                 tokenManager.moveToNextToken();
-                const nextToken = await tokenManager.getToken();
+                const nextToken = await tokenManager.getToken(requestModel);
 
                 if (!nextToken) {
                     log.warn('[withRetry] 没有可用的token了');
